@@ -1,0 +1,12 @@
+node_modules
+__pycache__/
+*.db
+*.db-*
+.env
+.taste-token.json
+.taste-token.json.lock
+logs/
+bin/
+ngrok.yml*
+.DS_Store
+*.log

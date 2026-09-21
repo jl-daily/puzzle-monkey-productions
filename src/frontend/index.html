@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>James' Watchlist</title>
+    <link rel="icon" href="/favicon.svg?v=10" type="image/svg+xml" />
+    <link rel="stylesheet" href="/style.css?v=53" />
+  </head>
+  <body>
+    <header id="top">
+      <h1 class="sr-only">James' Watchlist</h1>
+      <div id="logo-wrap" aria-hidden="true">
+        <div id="logo-band">
+          <div id="logo-title"><span class="cell">J</span><span class="cell">a</span><span class="cell">m</span><span class="cell">e</span><span class="cell">s&thinsp;'</span><span class="cell empty">&nbsp;</span><span class="cell">W</span><span class="cell">a</span><span class="cell">t</span><span class="cell">c</span><span class="cell">h</span><span class="cell">l</span><span class="cell">i</span><span class="cell">s</span><span class="cell">t</span></div>
+        </div>
+      </div>
+      <div id="search-bar">
+        <input
+          type="text"
+          id="search-input"
+          placeholder="Search movies or shows..."
+          autocomplete="off"
+        />
+        <div id="kind-toggle">
+          <button class="kind-btn active" data-kind="movie">Movie</button>
+          <button class="kind-btn" data-kind="tv">Show</button>
+          <button class="kind-btn" data-kind="notes">My notes</button>
+        </div>
+        <button id="search-btn">Search</button>
+      </div>
+    </header>
+
+    <div id="results" class="hidden"></div>
+
+    <main id="list">
+      <div id="cats"></div>
+      <div id="tabs"></div>
+      <div id="tab-search-wrap" class="hidden">
+        <input
+          type="text"
+          id="tab-search"
+          placeholder="Search all tabs..."
+          autocomplete="off"
+        />
+        <button id="tab-search-clear" title="Clear">✕</button>
+        <div id="genre-bar"></div>
+      </div>
+      <div id="count"></div>
+      <div id="slot-view" class="hidden">
+        <div class="dash-controls">
+          <div id="dash-mode">
+            <button class="dash-mode-btn" data-list="Rewatch w/ Di">
+              Rewatch w/ Di
+            </button>
+            <button class="dash-mode-btn" data-list="Rewatch w/o Di">
+              Rewatch w/o Di
+            </button>
+            <button class="dash-mode-btn" data-list="Movies">Movies</button>
+            <button class="dash-mode-btn" data-list="No Di">No Di</button>
+            <button class="dash-mode-btn" data-list="Shows">Shows</button>
+            <button class="dash-mode-btn" data-list="Shows w/o Di">
+              Shows w/o Di
+            </button>
+          </div>
+        </div>
+        <div class="dash-night">
+          <button id="night-btn">GENRE NIGHT</button>
+          <div id="night-genre"></div>
+        </div>
+        <div id="night-result" class="hidden"></div>
+
+        <div class="slot-window">
+          <div class="slot-reel slot-reel-title" id="reel-title">–</div>
+          <div class="slot-reel slot-reel-year" id="reel-year">–</div>
+          <div class="slot-reel slot-reel-genre" id="reel-genre">–</div>
+        </div>
+        <div id="slot-result" class="hidden"></div>
+
+        <div class="dash-genre-pick">
+          <select id="dash-genre-select"></select>
+          <button id="dash-spin-btn">SPIN</button>
+        </div>
+      </div>
+      <div
+        id="board-view"
+        class="hidden"
+        style="
+          margin-top: 12px;
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+        "
+      >
+        <div style="display: flex; gap: 16px">
+          <div
+            id="top-ten-james-movies"
+            style="
+              flex: 1;
+              background: var(--surface);
+              border: 1px solid var(--border);
+              border-radius: 8px;
+              padding: 10px;
+            "
+          >
+            <strong>Top 10 Movies — James (2026)</strong>
+            <ol
+              id="top-james-movies"
+              style="
+                margin: 8px 0 0 calc(18px + 0.25in);
+                padding: 0;
+                line-height: 1.6;
+              "
+            ></ol>
+          </div>
+          <div
+            id="top-ten-diana-movies"
+            style="
+              flex: 1;
+              background: var(--surface);
+              border: 1px solid #8b5cf6;
+              border-radius: 8px;
+              padding: 12px;
+            "
+          >
+            <strong style="color: #c4b5fd">Top 10 Movies — Diana (2026)</strong>
+            <ol
+              id="top-diana-movies"
+              style="
+                margin: 8px 0 0 calc(18px + 0.25in);
+                padding: 0;
+                line-height: 1.6;
+              "
+            ></ol>
+          </div>
+        </div>
+        <div style="display: flex; gap: 16px">
+          <div
+            id="top-ten-james-shows"
+            style="
+              flex: 1;
+              background: var(--surface);
+              border: 1px solid var(--border);
+              border-radius: 8px;
+              padding: 12px;
+            "
+          >
+            <strong>Top 10 Shows — James (2026)</strong>
+            <ol
+              id="top-james-shows"
+              style="
+                margin: 8px 0 0 calc(18px + 0.25in);
+                padding: 0;
+                line-height: 1.6;
+              "
+            ></ol>
+          </div>
+          <div
+            id="top-ten-diana-shows"
+            style="
+              flex: 1;
+              background: var(--surface);
+              border: 1px solid #8b5cf6;
+              border-radius: 8px;
+              padding: 10px;
+            "
+          >
+            <strong style="color: #c4b5fd">Top 10 Shows — Diana (2026)</strong>
+            <ol
+              id="top-diana-shows"
+              style="
+                margin: 8px 0 0 calc(18px + 0.25in);
+                padding: 0;
+                line-height: 1.6;
+              "
+            ></ol>
+          </div>
+        </div>
+      </div>
+      <div id="items"></div>
+      <div id="empty" class="hidden">
+        <p>Nothing here yet. Search for a movie or show to add it.</p>
+      </div>
+    </main>
+
+    <button
+      id="back-top"
+      class="hidden"
+      title="Back to top"
+      aria-label="Back to top"
+    >
+      ↑
+    </button>
+
+    <script src="/app.js?v=89"></script>
+  </body>
+</html>
