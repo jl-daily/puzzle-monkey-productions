@@ -1775,6 +1775,11 @@ function render() {
         if (pb == null) return -1;
         return rev ? pb - pa : pa - pb;
       });
+      // Diana-confirmed titles sink to the bottom. Positions are untouched,
+      // so unmarking restores the normal spot automatically.
+      const open = shown.filter((x) => !x.di_confirmed);
+      const done = shown.filter((x) => x.di_confirmed);
+      if (done.length && open.length) shown = [...open, ...done];
     }
   }
   const isShowsYear = /^Shows \d{4}$/.test(list);
