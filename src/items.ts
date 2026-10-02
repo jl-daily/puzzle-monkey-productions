@@ -230,6 +230,7 @@ const PATCH_FIELDS = [
   "taste_score",
   "reference",
   "watched_at",
+  "first_watched_at",
   "review",
   "di_review",
   "providers",
@@ -396,6 +397,29 @@ export function registerItems(app: Hono) {
               mark: true,
             });
         }
+        // A rewatched movie is a fresh viewing: refresh watched_at so the
+        // rewatch add lands on top of the 2026 tab (sorted watched_at DESC).
+        // The date is mirrored to the sheet because doSync pulls watched
+        // dates back sheet -> app and would otherwise revert it.
+        if (ready.kind === "movie" && ready.watched_at !== today()) {
+          const w = updateItem(ready.id, {
+            // Keep the pre-rewatch viewing date so the card can show both:
+            // watched_at moves to today (drives the 2026 sort), the original
+            // is preserved in first_watched_at.
+            ...(ready.first_watched_at == null && ready.watched_at
+              ? { first_watched_at: ready.watched_at }
+              : {}),
+            watched_at: today(),
+          });
+          if (w) {
+            Object.assign(ready, w);
+            void pushSheet({
+              op: "watched",
+              title: w.title,
+              date: w.watched_at,
+            });
+          }
+        }
       }
       return c.json(attach(ready, list));
     }
@@ -431,6 +455,20 @@ export function registerItems(app: Hono) {
               title: ex.title,
               mark: true,
             });
+        }
+        // Fresh viewing — refresh watched_at so a rewatch add tops the 2026
+        // tab (sorted watched_at DESC); mirrored to the sheet for doSync.
+        if (ex.kind === "movie" && ex.watched_at !== today()) {
+          const w = updateItem(ex.id, {
+            ...(ex.first_watched_at == null && ex.watched_at
+              ? { first_watched_at: ex.watched_at }
+              : {}),
+            watched_at: today(),
+          });
+          if (w) {
+            ex = w;
+            void pushSheet({ op: "watched", title: w.title, date: w.watched_at });
+          }
         }
       }
       const scored =
@@ -509,9 +547,18 @@ export function registerItems(app: Hono) {
       (updated.season_entries || []).some(
         (e) => e.my_rating != null || e.di_rating != null,
       );
+    // Only auto-file a scored show off Currently Watching once it's show-level
+    // finished (watched_at in 2026). Scoring at 3/4 or even 4/4 while still
+    // "on the last episode" keeps it on CW; it only leaves after the season
+    // is marked done — i.e. the last-episode tap stamps watched_at/ep_finished_at
+    // via the episodes flow (isShowComplete / isLastSeasonDone), which then
+    // triggers transferToShows2026. So score + last episode = move, either
+    // order, but scoring alone never moves.
+    const shouldAutoFile = finished2026(updated);
     if (
       updated.kind === "tv" &&
       hasScore &&
+      shouldAutoFile &&
       !updated.lists.includes(SHOWS_2026) &&
       updated.current_season != null
     ) {
@@ -554,6 +601,31 @@ export function registerItems(app: Hono) {
       if (updated.rewatch && !updated.rewatched_at) {
         const stamped = updateItem(id, { rewatched_at: today() });
         if (stamped) Object.assign(updated, stamped);
+      }
+      // Marking a rewatch is a fresh viewing: refresh watched_at so the item
+      // jumps back to the top of the 2026 tab (both the server query and the
+      // client sort order by watched_at DESC). Mirrored to the sheet because
+      // doSync pulls watched dates back sheet -> app. Skipped when the PATCH
+      // carries its own watched_at — an explicit date wins.
+      if (
+        updated.rewatch &&
+        fields.watched_at === undefined &&
+        updated.watched_at !== today()
+      ) {
+        const stamped = updateItem(id, {
+          ...(updated.first_watched_at == null && updated.watched_at
+            ? { first_watched_at: updated.watched_at }
+            : {}),
+          watched_at: today(),
+        });
+        if (stamped) {
+          Object.assign(updated, stamped);
+          void pushSheet({
+            op: "watched",
+            title: stamped.title,
+            date: stamped.watched_at,
+          });
+        }
       }
       const tab = typeof body.tab === "string" ? body.tab : "";
       void pushSheet({

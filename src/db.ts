@@ -170,6 +170,9 @@ if (!cols.some((c) => c.name === "rewatch")) {
 if (!cols.some((c) => c.name === "rewatched_at")) {
   db.run("ALTER TABLE items ADD COLUMN rewatched_at TEXT");
 }
+if (!cols.some((c) => c.name === "first_watched_at")) {
+  db.run("ALTER TABLE items ADD COLUMN first_watched_at TEXT");
+}
 if (!cols.some((c) => c.name === "runtime")) {
   db.run("ALTER TABLE items ADD COLUMN runtime INTEGER");
 }
@@ -242,6 +245,9 @@ export type Item = {
   reference: string | null;
   rated_at: string | null;
   watched_at: string | null;
+  // Original viewing date, kept when a rewatch moves watched_at to the
+  // rewatch date (so the 2026 tab tops out) — lets a card show both dates.
+  first_watched_at: string | null;
   review: string | null;
   di_review: string | null;
   providers: Provider[];
@@ -435,6 +441,7 @@ export function createItem(
     | "di_rating"
     | "rated_at"
     | "watched_at"
+    | "first_watched_at"
     | "created_at"
     | "review"
     | "positions"
@@ -493,6 +500,7 @@ export function updateItem(
       | "taste_score"
       | "reference"
       | "watched_at"
+      | "first_watched_at"
       | "review"
       | "providers"
       | "seasons"

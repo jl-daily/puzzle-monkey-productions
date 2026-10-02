@@ -901,7 +901,12 @@ function card(it, list, showLists = false) {
           it.watched_at ? "Change watched date" : "Add watched date"
         }">${
           it.watched_at
-            ? "Watched " + fmtDate(it.watched_at)
+            ?
+                "Watched " + fmtDate(it.watched_at) +
+                (it.first_watched_at &&
+                it.first_watched_at !== it.watched_at
+                  ? " · first " + fmtDate(it.first_watched_at)
+                  : "")
             : "Add watched date"
         }</button>`
       : "";
