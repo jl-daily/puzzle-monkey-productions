@@ -47,31 +47,37 @@ export function removeCmd(it: Item, tab: string) {
   return { op: "remove", tab, title: it.title, year: it.year, kind: it.kind };
 }
 
+// The score columns the app is allowed to write for an item. A show has no
+// single "J": the show tabs in the sheet keep one row per season (Archive
+// <year>, Currently Watching) and column E of each row is that season's
+// rating, while the app keeps one show-level rating plus per-season ones in
+// season_entries. Pushing the show-level number into column E therefore
+// flattens every season's score into it, and the gateway writes column E on
+// every row carrying that title, not just one. The sheet sync already refuses
+// to read or heal column E for a tv item, so the app stays out of it too: a
+// show's J lives where it was typed. (Column E on Shows / Shows w/o Di is
+// "Remaining", not a rating, and taste_score/D/status are still kept in step.)
+function scoreCmd(it: Item, tab?: string): Record<string, unknown> {
+  const cmd: Record<string, unknown> = {
+    op: "score",
+    title: it.title,
+    kind: it.kind,
+    taste_score: it.taste_score,
+    d: it.di_rating,
+  };
+  if (tab) cmd.tab = tab;
+  if (it.kind !== "tv") cmd.j = it.my_rating;
+  return cmd;
+}
+
 export function pushScore(it: Item, tab?: string): void {
   if (!GATEWAY) return;
   const tabs = tab ? [tab] : (it.lists ?? []);
   if (!tabs.length) {
-    void pushSheet({
-      op: "score",
-      title: it.title,
-      kind: it.kind,
-      taste_score: it.taste_score,
-      j: it.my_rating,
-      d: it.di_rating,
-    });
+    void pushSheet(scoreCmd(it));
     return;
   }
-  for (const t of tabs) {
-    void pushSheet({
-      op: "score",
-      tab: t,
-      title: it.title,
-      kind: it.kind,
-      taste_score: it.taste_score,
-      j: it.my_rating,
-      d: it.di_rating,
-    });
-  }
+  for (const t of tabs) void pushSheet(scoreCmd(it, t));
 }
 
 // Current-season episode summary for the sheet's CUR / Epis columns. The web UI

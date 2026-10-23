@@ -38,6 +38,39 @@ export function collapsePrimaries(lists: string[]): string[] {
   return lists.filter((l) => !PRIMARY_SET.has(l) || l === keep);
 }
 
+// Lists that only ever hold TV shows. The spreadsheet names a row and the tab
+// it lives on, so a row on one of these tabs is a show even when the caller
+// doesn't say so. Without this, /api/items/by-title defaulted to "movie" and
+// re-creating a missing show from its sheet row minted a movie with the show's
+// name — which is how the show "Carrie" kept turning into the 2002 movie.
+const SHOWS_RE = /^Shows( \d{4})?$/;
+export function isShowList(list: string): boolean {
+  return (
+    list === TABS.CURRENTLY_WATCHING ||
+    list === TABS.SHOWS_2026 ||
+    list === TABS.SHOWS_ARCHIVE ||
+    list === "Shows w/o Di" ||
+    list === "Shows Watched" ||
+    SHOWS_RE.test(list)
+  );
+}
+
+// The kind a list implies, when the caller doesn't say. null for lists that
+// both kinds use (spin, the taste.io library, the rewatch queues).
+export function kindForList(list: string): "tv" | "movie" | null {
+  if (!list) return null;
+  if (isShowList(list)) return "tv";
+  if (
+    list === TABS.MOVIES ||
+    list === TABS.NO_DI ||
+    list === TABS.WATCH_2026 ||
+    list === TABS.MOVIES_ARCHIVE ||
+    /^Archive \d{4}$/.test(list)
+  )
+    return "movie";
+  return null;
+}
+
 export function today(): string {
   const d = new Date();
   const m = String(d.getMonth() + 1).padStart(2, "0");

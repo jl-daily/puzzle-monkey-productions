@@ -38,7 +38,10 @@
 //
 // Each tab is a separate list. A title can live on several tabs. Deleting a
 // row removes that title from that tab in the app (and fully deletes it there
-// if it isn't on any other tab).
+// if it isn't on any other tab). Moving a row to a tab this sync does not read
+// ("Archive", "Archive <year>", "Taste Archive") is an archive: the title is
+// moved to that tab's list in the app and kept, never deleted — the sync only
+// deletes a title that has no row anywhere in the spreadsheet.
 //
 // The Rewatch tab is special: column G ("with Di?") decides which list a
 // title lands on — "Rewatch w/ Di" or "Rewatch w/o Di". A row with "yes" or
@@ -47,12 +50,31 @@
 // (the site shows a "?" badge) until you fill it in.
 
 var HEADERS = ["Movie Title", "Year", "Taste Score", "Genre", "J", "D", "with Di?", "Notes"];
-var DEFAULT_TABS = "Rewatch,Movies,No Di,Shows,Shows w/o Di,2026,Shows Watched,Archive";
+var DEFAULT_TABS = "Rewatch,Movies,No Di,Shows,Shows w/o Di,2026,Archive 2026,Archive";
 var W = HEADERS.length;
 var DI_VALUES = ["yes", "✓"];
 var GATEWAY_TOKEN = "5432de9c117db9bcfb54ad1c0b15e35323eee3416fdb3b37";
 
-var SHOW_TABS = ["Shows", "Shows w/o Di", "Shows Watched"];
+var SHOW_TABS = ["Shows", "Shows w/o Di", "Archive 2026"];
+
+// The finished-shows tab the "Archive rows..." menu reads. The tab this menu
+// was written against ("Shows Watched") no longer exists — finished shows are
+// filed by year ("Archive <year>") — so every use of the menu hit the
+// "no title header" alert. Prefer the current year's tab, fall back to the one
+// this script ships with.
+var ARCHIVE_ROWS_TAB = "Archive 2026";
+
+// Every tab that only ever holds TV shows. Currently Watching, Shows 2026 and
+// Shows <year> are shows too: leaving them out of SHOW_TABS meant a row the app
+// had lost was re-created as a *movie* (see pickApp_ below).
+function isShowTab_(tab) {
+  var t = String(tab || "");
+  return SHOW_TABS.indexOf(t) !== -1 ||
+    t === "Currently Watching" ||
+    t === "Shows 2026" ||
+    t === "Shows Archive" ||
+    /^Shows \d{4}$/.test(t);
+}
 
 // Per-tab column positions (1-based) for the review/Thoughts and Reference
 // columns. The "want to watch" tabs (Rewatch, Movies, No Di, Shows, Shows w/o
@@ -315,6 +337,115 @@ function findApp_(title, appByKey) {
   return appByKey[t] || null;
 }
 
+// Index the app's items by normalized title, keeping every item that shares a
+// title. A title is not an identity: the 2026 series "Carrie" and the 2002 TV
+// movie "Carrie" normalize the same, and binding both of their sheet rows to
+// whichever item happened to come first made doSync treat the other item as
+// deleted (it deleted the show, and its row re-attached to the movie).
+function indexApp_(items) {
+  var byKey = {};
+  for (var i = 0; i < items.length; i++) {
+    var k = normKey(items[i].title);
+    if (!k) continue;
+    if (!byKey[k]) byKey[k] = [];
+    byKey[k].push(items[i]);
+  }
+  return byKey;
+}
+
+// Which app item does this sheet row belong to? Same title first, then the row's
+// year (a row that says 2026 is not the 2002 film, even though the names match),
+// then the kind the tab implies. `claimed` remembers which item each earlier row
+// of the same name already matched, so a second row of that name prefers the
+// other work instead of binding to the same item twice.
+function pickApp_(title, year, tab, byKey, claimed) {
+  var key = normKey(title);
+  var list = byKey[key] || [];
+  if (!list.length) return null;
+  var wantKind = isShowTab_(tab) ? "tv" : null;
+  var y = String(year == null ? "" : year).trim();
+  var mine = (claimed && claimed[key]) || [];
+  function claimedBy_(it) {
+    for (var i = 0; i < mine.length; i++) if (mine[i] === it) return true;
+    return false;
+  }
+  // The Year column is not always the release year (the year tabs often hold
+  // the year a movie was watched), so a year that disagrees means "this might be
+  // the other work" — a hint, never a reason to drop the only candidate: an
+  // item with no row anywhere is what the sync deletes.
+  function yearMatch_(it) {
+    if (!y) return false;
+    var iy = String(it.year || "").trim();
+    return !!iy && iy === y;
+  }
+  var pick = null;
+  var i;
+  // the kind the tab implies *and* the row's year
+  if (wantKind) {
+    for (i = 0; i < list.length; i++) {
+      if (list[i].kind === wantKind && yearMatch_(list[i]) && !claimedBy_(list[i])) { pick = list[i]; break; }
+    }
+  }
+  // the row's year
+  if (!pick) {
+    for (i = 0; i < list.length; i++) {
+      if (yearMatch_(list[i]) && !claimedBy_(list[i])) { pick = list[i]; break; }
+    }
+  }
+  // the kind the tab implies
+  if (!pick && wantKind) {
+    for (i = 0; i < list.length; i++) {
+      if (list[i].kind === wantKind && !claimedBy_(list[i])) { pick = list[i]; break; }
+    }
+  }
+  // anything an earlier row of this name has not already taken
+  if (!pick) {
+    for (i = 0; i < list.length; i++) {
+      if (!claimedBy_(list[i])) { pick = list[i]; break; }
+    }
+  }
+  if (!pick) pick = list[0];
+  if (claimed) {
+    if (!claimed[key]) claimed[key] = [];
+    if (!claimed[key].length || claimed[key].indexOf(pick) === -1) claimed[key].push(pick);
+  }
+  return pick;
+}
+
+// Keep the by-title index in step with an item the sync just changed: replace
+// the stored object rather than adding the same id a second time, so later rows
+// of the same title see the updated lists/scores.
+function rememberApp_(byKey, byId, it) {
+  if (!it || !it.id) return it;
+  byId[String(it.id)] = it;
+  var k = normKey(it.title);
+  if (!k) return it;
+  if (!byKey[k]) byKey[k] = [];
+  for (var i = 0; i < byKey[k].length; i++) {
+    if (String(byKey[k][i].id) === String(it.id)) {
+      byKey[k][i] = it;
+      return it;
+    }
+  }
+  byKey[k].push(it);
+  return it;
+}
+
+// Is the app in the middle of watching this show? A show with an episode ticked
+// off, a season started or a current season set counts; a finished show (the
+// app stamps watched_at / ep_finished_at when its last known season completes)
+// does not, so archiving keeps working.
+function inProgress_(it) {
+  if (!it || it.kind !== "tv") return false;
+  if (it.watched_at || it.ep_finished_at) return false;
+  if (it.ep_started_at || it.current_season != null) return true;
+  var prog = it.episode_progress || {};
+  for (var k in prog) {
+    if (prog[k] && prog[k].length) return true;
+  }
+  return false;
+}
+
 function mapGenres_(genres) {
   if (!genres) return null;
   var parts = String(genres).split(",");
@@ -448,7 +579,7 @@ function stateSheet_(ss, tab) {
   return sh;
 }
 
-function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, membership, processed, positions) {
+function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, membership, processed, positions, claimed) {
   var sh = ss.getSheetByName(tab);
   if (!sh || sh.getLastRow() < 1) {
     counts.notabs.push(tab);
@@ -498,7 +629,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
     var effList = effectiveList_(tab, row);
     var flagged = tab === "Rewatch" && String(row[6] || "").trim() === "";
 
-    var appItem = findApp_(title, appByKey);
+    var appItem = pickApp_(title, row[1], tab, appByKey, claimed);
 
     if (!appItem) {
       try {
@@ -506,16 +637,16 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
           method: "POST",
           body: JSON.stringify({
             title: title,
+            year: String(row[1] || "").trim() || undefined,
             list: effList,
             position: i,
-            kind: SHOW_TABS.indexOf(tab) !== -1 ? "tv" : undefined,
+            kind: isShowTab_(tab) || headerIsShow_(headerRow) ? "tv" : undefined,
           }),
         });
         if (created && created.id) {
           appItem = created;
           appByTitle[normTitle(created.title)] = created;
-          appByKey[normKey(created.title)] = created;
-          appById[String(created.id)] = created;
+          rememberApp_(appByKey, appById, created);
           counts.added += created.existed ? 0 : 1;
         }
       } catch (e) {
@@ -536,7 +667,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
         });
         if (appItem) {
           appByTitle[normTitle(appItem.title)] = appItem;
-          appById[String(appItem.id)] = appItem;
+          rememberApp_(appByKey, appById, appItem);
         }
         counts.pushed++;
       } catch (e) {}
@@ -555,7 +686,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
         });
         if (appItem) {
           appByTitle[normTitle(appItem.title)] = appItem;
-          appById[String(appItem.id)] = appItem;
+          rememberApp_(appByKey, appById, appItem);
         }
         counts.pushed++;
       } catch (e) {}
@@ -571,7 +702,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
         });
         if (appItem) {
           appByTitle[normTitle(appItem.title)] = appItem;
-          appById[String(appItem.id)] = appItem;
+          rememberApp_(appByKey, appById, appItem);
         }
         counts.pushed++;
       } catch (e) {}
@@ -586,7 +717,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
         });
         if (appItem) {
           appByTitle[normTitle(appItem.title)] = appItem;
-          appById[String(appItem.id)] = appItem;
+          rememberApp_(appByKey, appById, appItem);
         }
         counts.pushed++;
       } catch (e) {}
@@ -607,7 +738,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
           });
           if (appItem) {
             appByTitle[normTitle(appItem.title)] = appItem;
-            appById[String(appItem.id)] = appItem;
+            rememberApp_(appByKey, appById, appItem);
           }
           counts.pushed++;
         } catch (e) {}
@@ -623,7 +754,7 @@ function syncTab_(ss, tab, appUrl, appByTitle, appByKey, appById, counts, member
           });
           if (appItem) {
             appByTitle[normTitle(appItem.title)] = appItem;
-            appById[String(appItem.id)] = appItem;
+            rememberApp_(appByKey, appById, appItem);
           }
           counts.pushed++;
         } catch (e) {}
@@ -665,23 +796,46 @@ function doSync() {
 
   var appByTitle = {};
   var appById = {};
-  var appByKey = {};
+  var appByKey = indexApp_(appItems);
   for (var i = 0; i < appItems.length; i++) {
     var it = appItems[i];
     appByTitle[normTitle(it.title)] = it;
     appById[String(it.id)] = it;
-    var k = normKey(it.title);
-    if (k && !appByKey[k]) appByKey[k] = it;
   }
 
   var membership = {};
   var processed = {};
   var positions = {};
-  var counts = { added: 0, pushed: 0, pulled: 0, deleted: 0, moved: 0, missing: 0, skippedTabs: [], notabs: [] };
+  var claimed = {};
+  var counts = { added: 0, pushed: 0, pulled: 0, deleted: 0, moved: 0, kept: 0, healed: 0, missing: 0, rescued: 0, skippedTabs: [], notabs: [] };
 
   var tabs = tabs_();
+  // Every title that lives on a tab this sync does not read (the Archive and
+  // taste tabs). Consulted before a deletion: a row that moved off a synced tab
+  // onto one of those is an archive, not a removal.
+  var offSync = indexOffSyncRows_(ss, tabs);
   for (var i = 0; i < tabs.length; i++) {
-    syncTab_(ss, tabs[i], appUrl, appByTitle, appByKey, appById, counts, membership, processed, positions);
+    syncTab_(ss, tabs[i], appUrl, appByTitle, appByKey, appById, counts, membership, processed, positions, claimed);
+  }
+
+  // A show the app is watching but that no synced tab has a row for is missing
+  // its row (a push still in flight, or two titles that normalize the same
+  // sharing one row) — not deleted. Put the row back instead of losing the
+  // show, which is what used to happen to "Carrie" on every sync.
+  for (var key in appById) {
+    var pit = appById[key];
+    if (!inProgress_(pit)) continue;
+    var plists = pit.lists || [];
+    for (var pl = 0; pl < plists.length; pl++) {
+      var ptab = plists[pl];
+      if (!processed[ptab]) continue;
+      if (membership[pit.id] && membership[pit.id][ptab]) continue;
+      if (restoreRow_(ss, ptab, pit)) {
+        counts.healed++;
+        if (!membership[pit.id]) membership[pit.id] = {};
+        membership[pit.id][ptab] = true;
+      }
+    }
   }
 
   for (var key in appById) {
@@ -703,6 +857,35 @@ function doSync() {
     });
     if (!confident) continue;
     if (intended.length === 0 && current.length > 0) {
+      // Never delete a show the app is in the middle of watching: a missing row
+      // means the row is missing (the app's push is slow, or two items share a
+      // title), and deleting it costs the show and its episode history. The
+      // app's own UI is how you remove it (the card's lists menu).
+      if (inProgress_(it)) {
+        counts.kept++;
+        continue;
+      }
+      // The row may still be in the spreadsheet, just not on a tab this sync
+      // reads. Dragging a row from a synced tab onto an Archive tab is how the
+      // sheet says "archive this"; deleting the item instead would cost the app
+      // the title and its history while the row sits in the sheet untouched.
+      // Move it to that tab's list. Only when no tab has a row for the title is
+      // the item really gone from the sheet.
+      var elsewhere = offSync[normKey(it.title)];
+      if (elsewhere) {
+        var keep = [elsewhere.tab];
+        for (var ci2 = 0; ci2 < current.length; ci2++) {
+          if (!processed[current[ci2]] && current[ci2] !== elsewhere.tab) keep.push(current[ci2]);
+        }
+        try {
+          fetchJson_(appUrl + "/api/items/" + it.id + "/lists", {
+            method: "PUT",
+            body: JSON.stringify({ lists: keep }),
+          });
+          counts.rescued++;
+        } catch (e) {}
+        continue;
+      }
       try {
         fetchJson_(appUrl + "/api/items/" + it.id, { method: "DELETE" });
         counts.deleted++;
@@ -750,6 +933,9 @@ function doSync() {
     " · added " + counts.added +
     " · moved " + counts.moved +
     " · deleted " + counts.deleted +
+    (counts.kept ? " · kept " + counts.kept + " (in progress)" : "") +
+    (counts.healed ? " · restored " + counts.healed + " row(s)" : "") +
+    (counts.rescued ? " · archived " + counts.rescued + " (row found on another tab)" : "") +
     (counts.missing ? " · not found: " + counts.missing : "") +
     (counts.skippedTabs.length ? " · skipped tabs: " + counts.skippedTabs.join(", ") : "") +
     (counts.notabs.length ? " · not in sheet: " + counts.notabs.join(", ") : "");
@@ -814,6 +1000,80 @@ function ensureStatusHeader_(sh, h) {
   if (cur === "") sh.getRange(h, 9).setValue("Status");
 }
 
+// Every title that has a row on a tab the sync does not read, keyed the way the
+// app's items are keyed. Used before a deletion so a row that was moved to an
+// archive tab ("Archive", "Archive <year>", "Taste Archive") is understood as
+// an archive instead of a removal. The first tab a title is found on wins, so a
+// title on several archive tabs lands on the first one scanned.
+function indexOffSyncRows_(ss, syncedTabs) {
+  var out = {};
+  var sheets = ss.getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    var sh = sheets[i];
+    var name = sh.getName();
+    if (name.indexOf("_sync_") === 0) continue;
+    if (syncedTabs.indexOf(name) !== -1) continue;
+    var h = headerRow_(sh);
+    var last = sh.getLastRow();
+    if (h < 1 || last <= h) continue;
+    var vals = sh.getRange(h + 1, 1, last - h, 1).getValues();
+    for (var r = 0; r < vals.length; r++) {
+      var t = String(vals[r][0] || "").trim();
+      if (!t) continue;
+      var k = normKey(t);
+      if (k && !out[k]) out[k] = { tab: name, title: t };
+    }
+  }
+  return out;
+}
+
+// True when a tab's header row carries episode tracking (CUR/Epis/Started/
+// Finished). Its rows are shows whatever the tab is called — the Archive <year>
+// tabs are "Series Title" tabs, and re-creating one of their rows as a movie is
+// how a show came back as a film of the same name.
+function headerIsShow_(hdr) {
+  for (var ci = 0; ci < hdr.length; ci++) {
+    var hn = normTitle(hdr[ci]);
+    if (hn === "cur" || hn === "epis" || hn === "total episodes" ||
+        hn === "started" || hn === "finished" || hn === "episodes") return true;
+  }
+  return false;
+}
+
+// Put an app item back on a tab as a new row. Used by doSync when a show the
+// app is watching has no row anywhere: the missing row must not cost the show
+// its place on the tab. Mirrors syncTab_'s column detection so the new row
+// lines up with the tab's existing columns.
+function restoreRow_(ss, tab, it) {
+  var sh = ss.getSheetByName(tab);
+  if (!sh) return false;
+  var h = headerRow_(sh);
+  if (h < 1) return false;
+  var hdr = sh.getRange(h, 1, 1, sh.getLastColumn()).getValues()[0];
+  var refIdx = -1;
+  var watchIdx = -1;
+  var startIdx = -1;
+  var fixedRef = REF_COL_BY_TAB[tab];
+  if (fixedRef != null && fixedRef - 1 < hdr.length) refIdx = fixedRef - 1;
+  for (var ci = 0; ci < hdr.length; ci++) {
+    var hn = normTitle(hdr[ci]);
+    if (refIdx === -1 && hn === "reference") refIdx = ci;
+    if (watchIdx === -1 && (hn === "watched" || hn === "date watched" || hn === "watched date" || hn === "date/watched" || hn === "date" || hn === "finished" || hn === "date finished" || hn === "finished date" || hn === "end date" || hn === "date completed" || hn === "completed")) watchIdx = ci;
+    if (startIdx === -1 && (hn === "started" || hn === "start date" || hn === "started date")) startIdx = ci;
+  }
+  var width = Math.max(W, hdr.length, refIdx + 1, watchIdx + 1, startIdx + 1);
+  var row = [];
+  for (var c = 0; c < width; c++) row[c] = "";
+  var filled = rowFromApp_(it, row, hdr, startIdx, watchIdx, tab);
+  var insertAt = h + 1;
+  while (insertAt <= sh.getLastRow()) {
+    if (String(sh.getRange(insertAt, 1).getValue()).trim() === "") break;
+    insertAt++;
+  }
+  sh.getRange(insertAt, 1, 1, filled.length).setValues([filled]);
+  return true;
+}
+
 function gatewayAdd_(b) {
   var ss = sheet_();
   var tab = baseTab_(b.tab);
@@ -838,7 +1098,29 @@ function gatewayAdd_(b) {
     if (refIdx < 0 && hn === "reference") refIdx = ci;
   }
   var refVal = b.reference != null && String(b.reference) !== "" ? String(b.reference) : "";
-  var row = b.force ? -1 : findRow_(sh, b.title);
+  // A row only belongs to this title if its year agrees too: the 2026 series
+  // "Carrie" and the 2002 TV movie are different works that share a name, and
+  // overwriting the movie's row with the show's year/status (what used to
+  // happen) leaves one row standing in for both. An empty year on either side
+  // is unknown and still matches.
+  var row = -1;
+  if (!b.force) {
+    var wantYear = b.year != null ? String(b.year).trim() : "";
+    var found = findRows_(sh, b.title);
+    var loose = -1;
+    for (var fi = 0; fi < found.length; fi++) {
+      var haveYear = String(sh.getRange(found[fi], 2).getValue() || "").trim();
+      if (!haveYear) {
+        if (loose < 0) loose = found[fi];
+        continue;
+      }
+      if (!wantYear || haveYear === wantYear) {
+        row = found[fi];
+        break;
+      }
+    }
+    if (row < 0) row = loose;
+  }
   if (row > 0) {
     var cur = sh.getRange(row, 1, 1, 4).getValues()[0];
     var tasteVal = taste != null ? taste : (cur[2] != null ? String(cur[2]) : "");
@@ -1582,24 +1864,37 @@ function parseRanges_(s) {
   return uniq;
 }
 
+// The tab "Archive rows..." should read: the current year's finished-shows tab
+// when it exists, otherwise the one this script ships with.
+function archiveRowsTab_(ss) {
+  var byYear = "Archive " + new Date().getFullYear();
+  if (ss.getSheetByName(byYear)) return byYear;
+  if (ss.getSheetByName(ARCHIVE_ROWS_TAB)) return ARCHIVE_ROWS_TAB;
+  return byYear;
+}
+
 // Sync menu -> "Archive rows...". Moves the row range you type out of the
-// "Shows Watched" tab into the Archive tab, then the app sync picks them up.
+// current year's finished-shows tab ("Archive <year>", e.g. "Archive 2026")
+// into the Archive tab, then the app sync picks them up.
 function archiveRows() {
   var ss = sheet_();
   var ui = SpreadsheetApp.getUi();
-  var src = ss.getSheetByName("Shows Watched");
+  var from = archiveRowsTab_(ss);
+  var src = ss.getSheetByName(from);
   var h = src ? headerRow_(src) : -1;
   if (h < 1) {
     ui.alert(
-      'The "Shows Watched" tab has no title header. It needs "Movie Title" / ' +
-        '"Show Title" / "Series Title" in column A within the first 10 rows.',
+      'No "' + from + '" tab with a title header was found. It needs ' +
+        '"Movie Title" / "Show Title" / "Series Title" in column A within the ' +
+        "first 10 rows of the row the header sits on. Set ARCHIVE_ROWS_TAB at " +
+        "the top of this script to read a different tab.",
     );
     return;
   }
   var res = ui.prompt(
-    "Archive rows — Shows Watched",
-    "Move rows (1-based spreadsheet row numbers) from Shows Watched to the " +
-      "Archive tab. Row 2 is the first title under the header.\n" +
+    "Archive rows — " + from,
+    "Move rows (1-based spreadsheet row numbers) from " + from + " to the " +
+      "Archive tab. Row " + (h + 1) + " is the first title under the header.\n" +
       "Examples: 2-98   or   3-52,54-118,120-183",
     ui.ButtonSet.OK_CANCEL,
   );
@@ -1611,8 +1906,8 @@ function archiveRows() {
     ui.alert("No data rows matched that range.");
     return;
   }
-  var moved = gatewayMove_({ from: "Shows Watched", to: "Archive", rows: rows });
-  ui.alert("Moved " + moved + " rows to Archive.");
+  var moved = gatewayMove_({ from: from, to: "Archive", rows: rows });
+  ui.alert("Moved " + moved + " rows from " + from + " to Archive.");
 }
 
 // Year for a row based on its "Finished" cell. Blank (no finish date) means
@@ -1925,10 +2220,13 @@ function gatewayRewatchScan_(b) {
 // sends kind so shows never get col E ("remaining episodes") clobbered.
 function gatewayScore_(b) {
   var ss = sheet_();
-  var taste = b.taste_score != null ? String(b.taste_score) : null;
+  var hasTaste = b.hasOwnProperty("taste_score");
+  var hasJ = b.hasOwnProperty("j");
+  var hasD = b.hasOwnProperty("d");
+  if (!hasTaste && !hasJ && !hasD) return { updated: 0 };
+  var taste = b.taste_score != null && String(b.taste_score) !== "" ? String(b.taste_score) : null;
   var j = b.j != null && String(b.j) !== "" ? String(b.j) : null;
   var d = b.d != null && String(b.d) !== "" ? String(b.d) : null;
-  if (taste == null && j == null && d == null) return { updated: 0 };
   var tabs = b.tab ? [b.tab] : tabs_();
   var updated = 0;
   for (var i = 0; i < tabs.length; i++) {
@@ -1939,9 +2237,18 @@ function gatewayScore_(b) {
     var hdr = sh.getRange(h, 1, 1, sh.getLastColumn()).getValues()[0];
     var rows = findRows_(sh, b.title);
     for (var k = 0; k < rows.length; k++) {
-      if (taste != null) sh.getRange(rows[k], 3).setValue(taste);
-      if (j != null && colIs_(hdr, 4, "j")) sh.getRange(rows[k], 5).setValue(j);
-      if (d != null && colIs_(hdr, 5, "d")) sh.getRange(rows[k], 6).setValue(d);
+      if (hasTaste) {
+        if (taste != null) sh.getRange(rows[k], 3).setValue(taste);
+        else sh.getRange(rows[k], 3).clearContent();
+      }
+      if (hasJ && colIs_(hdr, 4, "j")) {
+        if (j != null) sh.getRange(rows[k], 5).setValue(j);
+        else sh.getRange(rows[k], 5).clearContent();
+      }
+      if (hasD && colIs_(hdr, 5, "d")) {
+        if (d != null) sh.getRange(rows[k], 6).setValue(d);
+        else sh.getRange(rows[k], 6).clearContent();
+      }
       updated++;
     }
   }
@@ -2007,6 +2314,18 @@ function gatewayWatched_(b) {
     if (dateIdx < 0) continue;
     var spec = DATE_COL_BY_TAB[tabs[i]];
     var rows = findRows_(sh, b.title);
+    // Two works can share a title (the 2026 series "Carrie" vs the 2002 TV
+    // movie): only stamp the row whose year agrees, so one show's watch date
+    // can't land on the other's row.
+    if (b.year != null && String(b.year).trim() !== "") {
+      var wantYear = String(b.year).trim();
+      var keepRows = [];
+      for (var ri = 0; ri < rows.length; ri++) {
+        var rowYear = String(sh.getRange(rows[ri], 2).getValue() || "").trim();
+        if (!rowYear || rowYear === wantYear) keepRows.push(rows[ri]);
+      }
+      rows = keepRows;
+    }
     for (var k = 0; k < rows.length; k++) {
       if (spec && dateIdx === spec.col - 1 && dateFromISO_(date)) {
         sh.getRange(rows[k], dateIdx + 1).setValue(dateFromISO_(date));

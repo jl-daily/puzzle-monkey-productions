@@ -5,22 +5,6 @@ import { scheduleEpisodePush } from "./sheet";
 import { transferToShows2026 } from "./archive";
 import { today } from "./constants";
 
-// True once every season with progress has had all its episodes watched. A
-// season with unknown episode count can't be confirmed done, so it keeps the
-// show unfinished rather than stamping a finish date too early.
-export function isShowComplete(
-  prog: Record<string, number[]>,
-  counts: Record<string, number> | null,
-): boolean {
-  let any = false;
-  for (const [s, arr] of Object.entries(prog)) {
-    any = true;
-    const count = counts ? counts[s] : undefined;
-    if (count == null || arr.length < count) return false;
-  }
-  return any;
-}
-
 // True when season s is fully watched, is the show's last known season, and no
 // later season has progress yet, so stamping the show finished (Currently Watching
 // Started/Finished) is correct.
@@ -40,13 +24,18 @@ export function isLastSeasonDone(
 }
 
 // Mark/unmark the next watched episode. With a body.season the call targets a
-// specific season (per-season tracking, no rollover); otherwise the current
-// season is the highest one with progress (else the first known season, else
-// 1), and "inc" rolls into the next once a season's count is hit. Per-season
-// episode counts are fetched from TMDB lazily and cached on the item. The first
+// specific season (per-season tracking); otherwise the current season is the
+// highest one with progress (else the first known season, else 1), and a
+// completed season simply stops there — it never rolls into the next season,
+// which only starts once the user explicitly starts it (season chip / next
+// season button). Per-season episode counts are fetched from TMDB lazily and
+// cached on the item. The first
 // episode watched stamps ep_started_at; finishing the last episode stamps
 // ep_finished_at and watched_at (both pushed to the sheet's Started/Finished
-// columns for the Currently Watching tab).
+// columns for the Currently Watching tab). If watched_at already held a date
+// from a previous year (an earlier season's completion), the last-season
+// completion refreshes it to today and preserves the old date on
+// first_watched_at — otherwise the stale year blocks the Shows-2026 filing.
 export function registerEpisodes(app: Hono) {
   app.post("/api/items/:id/episodes", async (c) => {
     const body = await c.req.json().catch(() => ({}));
@@ -83,19 +72,13 @@ export function registerEpisodes(app: Hono) {
       const arr = prog[s] || [];
       const count = counts ? counts[s] : undefined;
       const last = arr.length ? Math.max(...arr) : 0;
-      if (count != null && last >= count) {
-        const seasons = Object.keys(counts || {})
-          .map(Number)
-          .sort((a, b) => a - b);
-        const ni = seasons.indexOf(s) + 1;
-        if (!perSeason && seasons.length && ni < seasons.length) {
-          touched.add(s);
-          s = seasons[ni];
-          prog[s] = [1];
-        }
-      } else {
+      if (count == null || last < count) {
         prog[s] = [...new Set([...arr, last + 1])];
       }
+      // A completed season stops here: never roll into the next season
+      // automatically. A new season starts only when the user explicitly
+      // starts it — it shouldn't begin the moment it exists (James doesn't
+      // start new seasons right away).
       touched.add(s);
     } else {
       let removed = false;
@@ -128,6 +111,7 @@ export function registerEpisodes(app: Hono) {
       ep_started_at?: string | null;
       ep_finished_at?: string | null;
       watched_at?: string | null;
+      first_watched_at?: string | null;
     } = { episode_progress: prog };
     if (!now) {
       patch.ep_started_at = null;
@@ -137,12 +121,29 @@ export function registerEpisodes(app: Hono) {
       if (op === "dec") {
         patch.ep_finished_at = null;
       } else if (
-        perSeason
-          ? isLastSeasonDone(prog, counts, s)
-          : isShowComplete(prog, counts)
+        // Show-level finish is gated the same way on every path: only the
+        // show's last known season completing stamps the show done. A
+        // mid-show season finishing (S1 of 3) records its own
+        // season_dates.finished_at but must never finish/archive the whole
+        // show off Currently Watching.
+        isLastSeasonDone(prog, counts, s)
       ) {
         if (!item.ep_finished_at) patch.ep_finished_at = today();
-        if (!item.watched_at) patch.watched_at = today();
+        if (!item.watched_at) {
+          patch.watched_at = today();
+        } else if (
+          String(item.watched_at).slice(0, 4) !== today().slice(0, 4)
+        ) {
+          // A show whose earlier season completed in a previous year still
+          // carries that old watched_at (the stamp below only ever set it once),
+          // which makes finished2026() false and silently blocks the move onto
+          // Shows 2026. Finishing the last season now is a fresh completion, so
+          // refresh watched_at to today and keep the original viewing date on
+          // first_watched_at (the card shows "Watched X · first Y").
+          if (item.first_watched_at == null)
+            patch.first_watched_at = item.watched_at;
+          patch.watched_at = today();
+        }
       }
     }
     // Per-season start/finish dates: first episode stamps started_at, reaching a
@@ -180,6 +181,8 @@ export function registerEpisodes(app: Hono) {
         patch.ep_finished_at !== item.ep_finished_at) ||
       (patch.watched_at !== undefined &&
         patch.watched_at !== item.watched_at) ||
+      (patch.first_watched_at !== undefined &&
+        patch.first_watched_at !== item.first_watched_at) ||
       JSON.stringify(seasonDates) !== JSON.stringify(item.season_dates);
     if (!changed) return c.json(getItemById(item.id));
     let updated = updateItem(item.id, {
@@ -196,6 +199,10 @@ export function registerEpisodes(app: Hono) {
           : patch.ep_finished_at,
       watched_at:
         patch.watched_at === undefined ? item.watched_at : patch.watched_at,
+      first_watched_at:
+        patch.first_watched_at === undefined
+          ? item.first_watched_at
+          : patch.first_watched_at,
     });
     if (!updated) return c.json({ error: "not found" }, 404);
     const wasFinished =

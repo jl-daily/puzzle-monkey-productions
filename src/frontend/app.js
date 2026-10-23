@@ -255,10 +255,12 @@ function effectivePin(it) {
 }
 
 // The season currently being watched: the one with a start date but no finish
-// date; else the season with partial episode progress; else the next known
-// season that isn't complete yet (a finished date or a sheet-sourced watched_at
-// counts as complete). Returns null when every known season is done, so no
-// season shows tracking.
+// date; else the season with partial episode progress; else — for a show where
+// nothing has been watched at all — the first season that isn't complete yet
+// (a finished date or a sheet-sourced watched_at counts as complete). Once
+// anything HAS been watched, never auto-point at a future season: a new
+// season waits until it's explicitly started (season chip / -> Sn button).
+// Returns null when no season is being tracked.
 function currentSeason(it) {
   if (it.status === "done") return null;
   const sd = it.season_dates || {};
@@ -291,6 +293,10 @@ function currentSeason(it) {
     const c = counts[s];
     if (arr.length && (c == null || arr.length < c)) return s;
   }
+  // Anything already watched means the show is being watched deliberately:
+  // don't auto-jump to a future season the user hasn't started yet. Fresh,
+  // untouched shows still track their first incomplete season (start point).
+  if (seasons.some((s) => seasonStarted(it, s))) return null;
   for (const s of seasons) {
     if (!complete(s)) return s;
   }
@@ -1004,9 +1010,19 @@ function card(it, list, showLists = false) {
       <div class="actions">
         ${
           list === "Movies"
-            ? `<button class="nodi-btn" title="She doesn't want to watch this">No Di</button>`
+            ? it.my_rating != null
+              ? // Seen, but still on a to-watch tab (a stale row that a sync
+                // re-added). "No Di" would be refused, so offer the move that
+                // is actually true: file it on 2026, off this list.
+                `<button class="undo-btn" data-move="file-2026" title="Already seen — file it on 2026 and take it off Movies">→ 2026</button>`
+              : `<button class="nodi-btn" title="She doesn't want to watch this">No Di</button>`
             : list === "No Di"
-              ? `<button class="undo-btn" title="Move back to Movies">↩ Movies</button>`
+              ? it.my_rating == null && it.di_rating != null
+                ? // Diana scored it, so it sits on No Di by rule: no undo button.
+                  `<span class="di-note" title="Diana has already scored this — clear her score to move it back to Movies">Scored by Di</span>`
+                : it.my_rating != null
+                  ? `<button class="undo-btn" data-move="file-2026" title="Already seen — file it on 2026 and take it off No Di">→ 2026</button>`
+                  : `<button class="undo-btn" title="Move back to Movies">↩ Movies</button>`
               : list === "Shows"
                 ? `<button class="nodi-btn" data-move="shows-nodi" title="She doesn't want to watch this">No Di</button>`
                 : list === "Shows w/o Di"
@@ -1019,6 +1035,11 @@ function card(it, list, showLists = false) {
         }
         <button class="score-btn" title="Enter scores (1–100)">Score</button>
         <button class="lists-btn">Lists</button>
+        ${
+          !showLists && (it.lists || []).includes(list)
+            ? `<button class="remove-btn" data-remove-list="${esc(list)}" title="Remove from ${esc(list)}">✕ Remove</button>`
+            : ""
+        }
         <div class="list-menu hidden"></div>
       </div>
     </div>
@@ -1077,7 +1098,15 @@ function card(it, list, showLists = false) {
       if (m === "shows-back") return moveItem(it, "Shows w/o Di", "Shows");
       if (m === "rewatch-back")
         return moveItem(it, "Rewatch w/o Di", "Rewatch w/ Di");
+      if (m === "file-2026") return fileTo2026(it);
       moveItem(it, "No Di", "Movies");
+    });
+
+  const removeBtn = el.querySelector(".remove-btn");
+  if (removeBtn)
+    removeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeFromList(it, removeBtn.dataset.removeList || list);
     });
 
   const scoreBtn = el.querySelector(".score-btn");
@@ -1377,6 +1406,81 @@ function editSeasonDate(el, it, s, which) {
   input.addEventListener("blur", () => finish(true));
 }
 
+// A movie James has scored is seen, so it cannot be added back to the to-watch
+// "Movies"/"No Di" tabs (the server refuses on purpose). But it can always come
+// *off* one — that is how a scored movie stranded on No Di gets removed. PUT
+// …/lists keeps the sheet in step: it drops the No Di row and adds (or updates)
+// the 2026 one, and 2026 is where the app files everything he has watched.
+async function fileTo2026(it) {
+  const lists = [
+    "2026",
+    ...(it.lists || []).filter(
+      (l) => l !== "No Di" && l !== "Movies" && l !== "2026",
+    ),
+  ];
+  try {
+    const updated = await api(`/api/items/${it.id}/lists`, {
+      method: "PUT",
+      body: JSON.stringify({ lists }),
+    });
+    if (updated && updated.deleted) items = items.filter((x) => x.id !== it.id);
+    else if (updated) Object.assign(it, updated);
+    render();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+// Movies James has scored are seen, so they should not be sitting on a
+// to-watch tab. The sheet sync puts rows back on Movies / No Di while they are
+// still there, so the tab can accumulate them; the bar sweeps the whole tab,
+// the card's "→ 2026" button does one.
+function staleToWatch(tab) {
+  if (tab !== "Movies" && tab !== "No Di") return [];
+  return items.filter(
+    (x) =>
+      x.kind === "movie" &&
+      x.my_rating != null &&
+      (x.lists || []).includes(tab),
+  );
+}
+
+function updateTidyBar() {
+  const bar = document.getElementById("tidy-bar");
+  if (!bar) return;
+  const stale = staleToWatch(list);
+  bar.classList.toggle("hidden", !stale.length);
+  if (!stale.length) {
+    bar.innerHTML = "";
+    return;
+  }
+  const n = stale.length;
+  bar.innerHTML = `<span>${n} title${n === 1 ? "" : "s"} here ${n === 1 ? "is" : "are"} already scored — seen, not to-watch.</span><button class="tidy-btn">Move ${n} to 2026</button>`;
+  const btn = bar.querySelector(".tidy-btn");
+  if (btn) btn.addEventListener("click", tidyWatched);
+}
+
+async function tidyWatched() {
+  const btn = document.querySelector("#tidy-bar .tidy-btn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Moving…";
+  }
+  try {
+    const res = await api("/api/tidy-watched", { method: "POST" });
+    toast(
+      res && res.moved
+        ? `Moved ${res.moved} watched title${res.moved === 1 ? "" : "s"} to 2026`
+        : "Nothing to tidy",
+    );
+    items = await api("/api/items");
+    render();
+  } catch (err) {
+    toast(err.message, true);
+    render();
+  }
+}
+
 async function moveItem(it, from, to) {
   try {
     const updated = await api(`/api/items/${it.id}/move`, {
@@ -1390,9 +1494,49 @@ async function moveItem(it, from, to) {
   }
 }
 
+// Take a title off the tab it is being viewed on. The server also asks the
+// spreadsheet to drop that tab's row, so a later sync cannot put it back. When
+// this is the last list it belongs to the server deletes the item, which also
+// throws away its score/history — so confirm that case first.
+async function removeFromList(it, list) {
+  if (!(it.lists || []).includes(list)) return;
+  const remaining = it.lists.filter((l) => l !== list);
+  if (!remaining.length) {
+    const extra =
+      it.kind === "tv"
+        ? " Any episode tracking on it will be deleted too."
+        : "";
+    const ok = confirm(
+      `Remove "${it.title}" from "${list}"?\n\nIt isn't on any other list, so this deletes it from your watchlist.${extra}`,
+    );
+    if (!ok) return;
+  }
+  try {
+    const updated = await api(`/api/items/${it.id}/lists`, {
+      method: "PUT",
+      body: JSON.stringify({ lists: remaining }),
+    });
+    if (updated && updated.deleted) {
+      items = items.filter((x) => x.id !== it.id);
+      toast(`Removed "${it.title}"`);
+    } else {
+      if (updated) Object.assign(it, updated);
+      toast(`Removed "${it.title}" from "${list}"`);
+    }
+    render();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 function buildListMenu(menu, it) {
-  const scored =
-    it.kind === "movie" && (it.my_rating != null || it.di_rating != null);
+  const movie = it.kind === "movie";
+  const seenByMe = movie && it.my_rating != null;
+  const seenByDi = movie && it.di_rating != null;
+  // Diana's score alone means only she has seen it, so the movie may sit on
+  // "No Di" (watch it solo) but never on the watch-together "Movies" list.
+  const offToWatch = (n) =>
+    seenByMe ? n === "Movies" || n === "No Di" : seenByDi && n === "Movies";
   for (const n of listNames()) {
     if (n === "Spin") continue;
     const label = document.createElement("label");
@@ -1400,9 +1544,20 @@ function buildListMenu(menu, it) {
     cb.type = "checkbox";
     cb.checked = (it.lists || []).includes(n);
     cb.dataset.list = n;
-    if (scored && (n === "Movies" || n === "No Di")) {
-      cb.disabled = true;
-      cb.title = "Already scored — this movie is seen, not to-watch";
+    if (offToWatch(n)) {
+      // A seen movie can't be *added* to a to-watch tab, but unchecking one it
+      // is already on has to stay possible — that is how a scored movie stuck
+      // on No Di (a stale row the sync re-added) gets removed from the list.
+      if (cb.checked) {
+        cb.title = seenByMe
+          ? "Already scored — uncheck to take it off this list"
+          : "Diana has already scored this one — uncheck to take it off Movies";
+      } else {
+        cb.disabled = true;
+        cb.title = seenByMe
+          ? "Already scored — this movie is seen, not to-watch"
+          : "Diana has already scored this one — it belongs on No Di";
+      }
     }
     label.appendChild(cb);
     label.appendChild(document.createTextNode(" " + n));
@@ -1675,6 +1830,51 @@ function bestTab(x) {
   );
 }
 
+// The 🧩 "Diana confirmed" mark means "this pick stays on the sheet", so it
+// only sinks to the bottom of the queues where a pick can be cleared away. The
+// date-ordered tabs (2026, Shows <year>) and the archives keep their own order:
+// sinking a handful of titles to the end there broke the chronology, dropping
+// movies watched today below ones from January.
+const SINK_CONFIRMED = [
+  "Movies",
+  "No Di",
+  "Rewatch w/ Di",
+  "Rewatch w/o Di",
+  "Shows",
+  "Shows w/o Di",
+];
+
+// Default tab order: the 2026 tab is strictly newest-watch-first; every other
+// tab follows the sheet row order (positions), reversed for Currently Watching,
+// with Diana-confirmed picks sinking out of the way on the to-watch queues.
+function sortDefault(shown, list) {
+  const rev = list === "Currently Watching";
+  shown.sort((a, b) => {
+    if (list === "2026") {
+      if (!a.watched_at && !b.watched_at) return 0;
+      if (!a.watched_at) return 1;
+      if (!b.watched_at) return -1;
+      return b.watched_at.localeCompare(a.watched_at);
+    }
+    const pa = a.positions && a.positions[list] != null ? a.positions[list] : null;
+    const pb = b.positions && b.positions[list] != null ? b.positions[list] : null;
+    if (pa == null && pb == null)
+      return rev
+        ? (a.created_at || "").localeCompare(b.created_at || "")
+        : (b.created_at || "").localeCompare(a.created_at || "");
+    if (pa == null) return 1;
+    if (pb == null) return -1;
+    return rev ? pb - pa : pa - pb;
+  });
+  if (SINK_CONFIRMED.includes(list)) {
+    // Positions are untouched, so unmarking restores the normal spot.
+    const open = shown.filter((x) => !x.di_confirmed);
+    const done = shown.filter((x) => x.di_confirmed);
+    if (done.length && open.length) shown = [...open, ...done];
+  }
+  return shown;
+}
+
 function render() {
   const tabsEl = document.getElementById("tabs");
   const catsEl = document.getElementById("cats");
@@ -1687,6 +1887,7 @@ function render() {
         : b.dataset.tab === list;
       b.classList.toggle("active", on);
     });
+  updateTidyBar();
   const slotView = document.getElementById("slot-view");
   const boardView = document.getElementById("board-view");
   const genreBar = document.getElementById("genre-bar");
@@ -1760,31 +1961,7 @@ function render() {
         return 0;
       });
     } else {
-      const rev = list === "Currently Watching";
-      shown.sort((a, b) => {
-        if (list === "2026") {
-          if (!a.watched_at && !b.watched_at) return 0;
-          if (!a.watched_at) return 1;
-          if (!b.watched_at) return -1;
-          return b.watched_at.localeCompare(a.watched_at);
-        }
-        const pa =
-          a.positions && a.positions[list] != null ? a.positions[list] : null;
-        const pb =
-          b.positions && b.positions[list] != null ? b.positions[list] : null;
-        if (pa == null && pb == null)
-          return rev
-            ? (a.created_at || "").localeCompare(b.created_at || "")
-            : (b.created_at || "").localeCompare(a.created_at || "");
-        if (pa == null) return 1;
-        if (pb == null) return -1;
-        return rev ? pb - pa : pa - pb;
-      });
-      // Diana-confirmed titles sink to the bottom. Positions are untouched,
-      // so unmarking restores the normal spot automatically.
-      const open = shown.filter((x) => !x.di_confirmed);
-      const done = shown.filter((x) => x.di_confirmed);
-      if (done.length && open.length) shown = [...open, ...done];
+      shown = sortDefault(shown, list);
     }
   }
   const isShowsYear = /^Shows \d{4}$/.test(list);
@@ -2313,6 +2490,9 @@ function openScoreInline(btn, it, season = null) {
       body.season_entries = entries;
     }
     const ls = it.lists || [];
+    // How a fresh score reshapes the list is the server's call (a J score files
+    // to 2026; a Diana-only score moves the movie to No Di). This flag just
+    // says "this score decides where the movie belongs".
     if (
       it.kind === "movie" &&
       (ls.includes("Movies") || ls.includes("No Di")) &&

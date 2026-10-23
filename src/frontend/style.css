@@ -890,6 +890,47 @@ mark {
   color: var(--text2);
 }
 
+/* Watched-but-still-on-a-to-watch-tab sweep, shown above the cards. */
+#tidy-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 12px 24px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid #7c5cff;
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 13px;
+  color: var(--text2);
+}
+
+#tidy-bar.hidden {
+  display: none;
+}
+
+#tidy-bar .tidy-btn {
+  padding: 6px 12px;
+  border: 1px solid #7c5cff;
+  border-radius: 6px;
+  background: transparent;
+  color: #c4b5fd;
+  font: inherit;
+  cursor: pointer;
+}
+
+#tidy-bar .tidy-btn:hover:not(:disabled) {
+  background: #7c5cff;
+  color: #fff;
+}
+
+#tidy-bar .tidy-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 #items {
   padding: 16px 24px;
   display: flex;
@@ -1734,6 +1775,24 @@ mark {
   color: var(--purple);
 }
 
+/* Per-card "take it off this tab" action. Pushed to the right so it is easy to
+   find and hard to hit by accident while reaching for Score/Lists. */
+.remove-btn {
+  margin-left: auto;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.remove-btn:hover {
+  border-color: #e0566b;
+  color: #e0566b;
+}
+
 .nodi-btn {
   padding: 6px 12px;
   border-radius: 6px;
@@ -1762,6 +1821,16 @@ mark {
 .undo-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* A movie Diana has already scored sits on No Di by rule, so it gets a note
+   instead of the ↩ Movies undo (which the server refuses for these). */
+.di-note {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px dashed var(--border);
+  color: var(--text2);
+  font-size: 12px;
 }
 
 /* Toast */

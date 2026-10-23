@@ -1,4 +1,4 @@
-import type { Hono } from "hono";
+import type { Context, Hono } from "hono";
 import {
   listItems,
   getItem,
@@ -15,7 +15,14 @@ import {
 import type { Item } from "./db";
 import { watchProviders } from "./providers";
 import { normTitle, tasteUrl } from "./taste";
-import { TABS, today, PRIMARY_SET, collapsePrimaries } from "./constants";
+import {
+  TABS,
+  today,
+  PRIMARY_SET,
+  collapsePrimaries,
+  kindForList,
+  isShowList,
+} from "./constants";
 import {
   pushSheet,
   removeCmd,
@@ -30,13 +37,173 @@ function internal(c: { req: { header: (k: string) => string | undefined } }) {
   return c.req.header("x-internal") === "1";
 }
 
+// Is this request the spreadsheet reconciling itself against the app? doSync
+// pushes a whole tab's worth of list membership in one go, and it infers
+// "deleted from the sheet" from a row it can't find. Its fetch helper already
+// sends x-internal (the same marker the app's own scripts use), and it runs on
+// Google's servers, so either the marker or the user agent identifies it. The
+// browser UI sends neither, which is what lets the guards below protect the
+// app's tracking without getting in the way of a list change made by hand.
+function isSyncClient(c: { req: { header: (k: string) => string | undefined } }) {
+  if (internal(c)) return true;
+  if (c.req.header("x-sheet-sync") === "1") return true;
+  return /Google-Apps-Script/i.test(c.req.header("user-agent") || "");
+}
+
+// Is the app in the middle of watching this show? A show with episodes ticked
+// off, a season in progress or a current season set is being tracked right
+// now. Once it's finished (the app stamps watched_at / ep_finished_at when the
+// last known season completes) it is no longer "in progress" and the normal
+// sheet rules apply again.
+function activelyTracked(it: Item): boolean {
+  if (it.kind !== "tv") return false;
+  if (it.watched_at || it.ep_finished_at) return false;
+  return (
+    it.ep_started_at != null ||
+    it.current_season != null ||
+    Object.values(it.episode_progress || {}).some(
+      (arr) => (arr || []).length > 0,
+    )
+  );
+}
+
+// Year + kind are what tell two items sharing a title apart (the 2026 show
+// "Carrie" vs the 2002 TV movie). Prefer the closest match, and never fall
+// through to a title-only match when the caller gave us something better.
+function pickByTitle(
+  candidates: Item[],
+  year: string | null,
+  kind: string,
+): Item | null {
+  if (!candidates.length) return null;
+  const sameYear = (it: Item) =>
+    year == null || String(it.year || "").trim() === year;
+  return (
+    candidates.find((it) => it.kind === kind && sameYear(it)) ??
+    candidates.find((it) => it.kind === kind) ??
+    candidates.find(sameYear) ??
+    candidates[0]
+  );
+}
+
+// The sheet's recovery route has to answer with something the spreadsheet can
+// use: when a row names a work we can't mint, attaching it to the closest
+// same-title item keeps the sheet resolvable instead of leaving a row that 404s
+// on every sync. It never creates anything, so a stale year in the sheet cannot
+// add a second item for one title.
+function attachClosest(
+  c: Context,
+  named: Item[],
+  title: string,
+  year: string | null,
+  kind: string,
+  list: string,
+) {
+  const fallback = pickByTitle(named, year, kind);
+  if (!fallback) return c.json({ error: "not found" }, 404);
+  console.warn(
+    `by-title "${title}" year=${year}: attaching to ${fallback.kind} ${fallback.year} (${fallback.id})`,
+  );
+  if (list && list !== TABS.SPIN && !blockedFromList(fallback, list))
+    setItemLists(fallback.id, [
+      list,
+      ...fallback.lists.filter((l) => l !== list),
+    ]);
+  return c.json({ ...getItemById(fallback.id)!, existed: true });
+}
+
 const TO_WATCH: Set<string> = new Set([TABS.MOVIES, TABS.NO_DI]);
 
-// A scored movie has been seen, so it doesn't belong on a to-watch list. Keep
-// the Movies/No Di tabs free of anything already scored (and thus archived).
+// Diana's score means she has seen the movie; James's means he has. A movie
+// only Diana has scored is no longer a pick to watch together: it belongs on
+// "No Di" (he can still watch it solo), never on "Movies".
+function seenByJames(it: Item): boolean {
+  return it.kind === "movie" && it.my_rating != null;
+}
+
+function seenByDianaOnly(it: Item): boolean {
+  return it.kind === "movie" && it.my_rating == null && it.di_rating != null;
+}
+
+// Lists a title sits on *before* it has been watched: the to-watch picks
+// (Movies / No Di / spin), the shows queued up to start, and a show in
+// progress. Every other list — the year tabs, the archives, the taste.io
+// library, the rewatch queue — only ever holds titles James has already seen.
+const TO_WATCH_LISTS: Set<string> = new Set([
+  TABS.MOVIES,
+  TABS.NO_DI,
+  TABS.CURRENTLY_WATCHING,
+  TABS.SPIN,
+  "Shows",
+  "Shows w/o Di",
+]);
+
+// Has James watched this title before? A previous viewing shows up as a watch
+// date, an explicit rewatch mark, or membership of a list that only holds
+// watched titles. A title parked on a to-watch list has not been seen yet.
+function seenBefore(it: Item): boolean {
+  if (it.watched_at || it.first_watched_at || it.rewatched_at || it.rewatch)
+    return true;
+  return it.lists.some((l) => !TO_WATCH_LISTS.has(l));
+}
+
+// Would putting this movie on `list` break the rules above?
+function blockedFromList(it: Item, list: string): boolean {
+  if (seenByJames(it)) return TO_WATCH.has(list);
+  return seenByDianaOnly(it) && list === TABS.MOVIES;
+}
+
+// Sheet "add" payload for the No Di tab. A Diana-only score lands a movie
+// there, and doSync treats sheet tabs as the source of truth for list
+// membership, so the spreadsheet has to see the move or it would put the movie
+// back on Movies on the next sync.
+function noDiSheetAdd(it: Item) {
+  return {
+    op: "add",
+    tab: TABS.NO_DI,
+    title: it.title,
+    year: it.year,
+    kind: it.kind,
+    status: it.status,
+    genres: it.genres,
+    taste_score: it.taste_score,
+    j: it.my_rating,
+    d: it.di_rating,
+    date: it.watched_at,
+  };
+}
+
+// Move a movie Diana scored off "Movies" onto "No Di" and pin it to the top
+// of that tab so the jump is easy to spot. watched_at stays empty — only Diana
+// has seen it, so it must not read as watched-in-2026. No-op when not on Movies.
+function moveToNoDi(it: Item): Item | null {
+  if (!it.lists.includes(TABS.MOVIES)) return null;
+  const moved = setItemLists(it.id, [
+    TABS.NO_DI,
+    ...it.lists.filter((l) => !TO_WATCH.has(l) && !PRIMARY_SET.has(l)),
+  ]);
+  if (!moved) return null;
+  setListPosition(moved.id, TABS.NO_DI, topPosition(TABS.NO_DI));
+  // Add before remove: the sheet gateway is slow (tens of seconds per call), and
+  // doSync treats a title that appears on NO tab as deleted. Removing first
+  // leaves exactly that gap — a sync landing in it deleted a real movie once.
+  // Landing on two tabs for a moment is harmless by comparison: the next sync
+  // just sees the move and settles on the destination.
+  void pushSheet(noDiSheetAdd(moved));
+  void pushSheet(removeCmd(it, TABS.MOVIES));
+  return getItemById(moved.id) ?? moved;
+}
+
+// Keep the to-watch tabs honest on every write path. A movie James has seen
+// (his own score) doesn't belong on a to-watch list at all — the score flow
+// files it to the 2026 tab, and this is the backstop for all other paths. One
+// that only Diana has scored relocates to "No Di" instead of vanishing off the
+// watchlist entirely.
 function stripScored(it: Item): Item | null {
-  if (it.kind !== "movie" || (it.my_rating == null && it.di_rating == null))
-    return it;
+  if (!seenByJames(it) && !seenByDianaOnly(it)) return it;
+  if (!seenByJames(it)) {
+    return it.lists.includes(TABS.MOVIES) ? (moveToNoDi(it) ?? it) : it;
+  }
   const kept = it.lists.filter((l) => !TO_WATCH.has(l));
   return kept.length === it.lists.length ? it : setItemLists(it.id, kept);
 }
@@ -65,6 +232,7 @@ function ensureShows2026(it: Item): Item {
     tab: TABS.SHOWS_2026,
     title: updated.title,
     year: updated.year,
+    kind: updated.kind,
     status: updated.status,
     genres: updated.genres,
     taste_score: updated.taste_score,
@@ -182,12 +350,7 @@ function attach(it: Item, list: string): Item {
       const stamped = updateItem(it.id, { watched_at: today() });
       if (stamped) it = stamped;
     }
-    if (
-      it.kind === "movie" &&
-      (it.my_rating != null || it.di_rating != null) &&
-      TO_WATCH.has(list)
-    )
-      return it;
+    if (blockedFromList(it, list)) return it;
     if (!it.lists.includes(list)) {
       const target = collapsePrimaries([
         list,
@@ -200,12 +363,15 @@ function attach(it: Item, list: string): Item {
       if (updated) {
         if (list !== TABS.SPIN)
           void setListPosition(updated.id, list, topPosition(list));
-        for (const d of dropped) void pushSheet(removeCmd(it, d));
+        // Destination row first, source rows second (see moveToNoDi): the sheet
+        // gateway is slow, and doSync reads a title that appears on no tab as
+        // deleted. A row briefly on two tabs is self-correcting; a gap is not.
         void pushSheet({
           op: "add",
           tab: list,
           title: updated.title,
           year: updated.year,
+          kind: updated.kind,
           status: updated.status,
           genres: updated.genres,
           taste_score: updated.taste_score,
@@ -213,6 +379,7 @@ function attach(it: Item, list: string): Item {
           d: updated.di_rating,
           date: updated.watched_at,
         });
+        for (const d of dropped) void pushSheet(removeCmd(it, d));
         if (updated.taste_score == null) pullTaste(updated);
         return updated;
       }
@@ -382,7 +549,13 @@ export function registerItems(app: Hono) {
         seasonOk && existing.kind === "tv"
           ? await startSeason(existing, season)
           : existing;
-      if (!ready.rewatch) {
+      // A re-add is only a rewatch when James has actually seen the title
+      // before. Re-adding something that was merely parked on a to-watch list
+      // (No Di, Movies, spin) is a move: it must not pick up a rewatch mark or
+      // a watch date, either of which would claim a viewing that never
+      // happened.
+      const seen = seenBefore(ready);
+      if (seen && !ready.rewatch) {
         const stamped = updateItem(ready.id, {
           rewatch: true,
           rewatched_at: ready.rewatched_at || today(),
@@ -400,8 +573,16 @@ export function registerItems(app: Hono) {
         // A rewatched movie is a fresh viewing: refresh watched_at so the
         // rewatch add lands on top of the 2026 tab (sorted watched_at DESC).
         // The date is mirrored to the sheet because doSync pulls watched
-        // dates back sheet -> app and would otherwise revert it.
-        if (ready.kind === "movie" && ready.watched_at !== today()) {
+        // dates back sheet -> app and would otherwise revert it. Only an add
+        // to the year tab means "I just watched this" — adding a title to a
+        // to-watch list is a plan, so it keeps whatever date it already had
+        // (and none, if it was never watched).
+        if (
+          seen &&
+          ready.kind === "movie" &&
+          list === TABS.WATCH_2026 &&
+          ready.watched_at !== today()
+        ) {
           const w = updateItem(ready.id, {
             // Keep the pre-rewatch viewing date so the card can show both:
             // watched_at moves to today (drives the 2026 sort), the original
@@ -416,6 +597,8 @@ export function registerItems(app: Hono) {
             void pushSheet({
               op: "watched",
               title: w.title,
+              year: w.year,
+              kind: w.kind,
               date: w.watched_at,
             });
           }
@@ -434,49 +617,56 @@ export function registerItems(app: Hono) {
     const body = await c.req.json().catch(() => ({}));
     const title = String(body.title || "").trim();
     const list = typeof body.list === "string" ? body.list : "";
-    const kind = body.kind === "tv" ? "tv" : "movie";
+    const year =
+      body.year != null && String(body.year).trim()
+        ? String(body.year).trim()
+        : null;
+    // The caller (the sheet) may not say whether the row is a show or a movie,
+    // but the tab it sits on does: a row on "Currently Watching"/"Shows …" is a
+    // show. Defaulting to "movie" here is what turned a deleted show back into
+    // a movie of the same name.
+    const kind =
+      body.kind === "tv" || body.kind === "movie"
+        ? body.kind
+        : (kindForList(list) ?? "movie");
     if (!title) return c.json({ error: "title required" }, 400);
-    const existing = listItems().find(
+    const named = listItems().filter(
       (it) => normTitle(it.title) === normTitle(title),
     );
+    // A row that names a different year is a hint that it is the *other* work
+    // (the 2026 series and the 2002 TV movie both called "Carrie"), never a
+    // reason to drop the only candidate: the sheet's Year column is not always
+    // the release year (the year tabs often hold the year a movie was watched),
+    // and an item left with no row anywhere is what the reconcile deletes.
+    const sameWork = named.filter(
+      (it) => year == null || it.year == null || String(it.year).trim() === year,
+    );
+    const sameKind = named.filter((it) => it.kind === kind);
+    let existing = pickByTitle(sameWork, year, kind);
+    if (!existing && sameKind.length) {
+      existing = pickByTitle(sameKind, year, kind);
+      if (existing)
+        console.warn(
+          `by-title "${title}" year=${year}: sheet year disagrees with the only ${kind} of that name (${existing.year}); attaching to it`,
+        );
+    }
+    // Only worth minting the other work when the collection has nothing of the
+    // kind this row implies — otherwise a stale year in the sheet would give us
+    // two items for one title.
+    const otherWork = !existing && !sameKind.length && !!named.length && year != null;
+    if (named.length > 1 || otherWork)
+      console.log(
+        `by-title "${title}" year=${year} kind=${kind} list=${list}: ${named.length} items share the title (${named.map((it) => `${it.kind} ${it.year}`).join(", ")}) -> ${existing ? `${existing.kind} ${existing.year}` : otherWork ? "none, creating the " + kind : "none"}`,
+      );
     if (existing) {
-      let ex = existing;
-      if (!ex.rewatch) {
-        const stamped = updateItem(ex.id, {
-          rewatch: true,
-          rewatched_at: ex.rewatched_at || today(),
-        });
-        if (stamped) {
-          ex = stamped;
-          if (ex.kind === "movie" && list)
-            void pushSheet({
-              op: "markRewatch",
-              tab: list,
-              title: ex.title,
-              mark: true,
-            });
-        }
-        // Fresh viewing — refresh watched_at so a rewatch add tops the 2026
-        // tab (sorted watched_at DESC); mirrored to the sheet for doSync.
-        if (ex.kind === "movie" && ex.watched_at !== today()) {
-          const w = updateItem(ex.id, {
-            ...(ex.first_watched_at == null && ex.watched_at
-              ? { first_watched_at: ex.watched_at }
-              : {}),
-            watched_at: today(),
-          });
-          if (w) {
-            ex = w;
-            void pushSheet({ op: "watched", title: w.title, date: w.watched_at });
-          }
-        }
-      }
-      const scored =
-        ex.kind === "movie" && (ex.my_rating != null || ex.di_rating != null);
+      // This path is the sheet's recovery route (doSync recreates a title the
+      // app is missing), not a viewing gesture: re-attaching a title must not
+      // mark it a rewatch or stamp a watch date on it.
+      const ex = existing;
       if (
         list &&
         list !== TABS.SPIN &&
-        !(scored && TO_WATCH.has(list)) &&
+        !blockedFromList(ex, list) &&
         !ex.lists.includes(list)
       ) {
         setItemLists(ex.id, [list, ...ex.lists.filter((l) => l !== list)]);
@@ -490,15 +680,32 @@ export function registerItems(app: Hono) {
       const d = await tmdb(
         `/search/${kind}?query=${encodeURIComponent(title)}`,
       );
-      const r =
-        (d.results || []).find(
-          (x) =>
-            normTitle((kind === "tv" ? x.name : x.title) ?? "") ===
-            normTitle(title),
-        ) || (d.results || [])[0];
-      if (!r?.id) return c.json({ error: "not found" }, 404);
+      const yearOf = (x: { first_air_date?: string; release_date?: string }) =>
+        ((kind === "tv" ? x.first_air_date : x.release_date) || "").slice(0, 4) ||
+        null;
+      const sameName = (d.results || []).filter(
+        (x) => normTitle((kind === "tv" ? x.name : x.title) ?? "") === normTitle(title),
+      );
+      const yearMatch = sameName.find((x) => year != null && yearOf(x) === year);
+      // For the other work only an exact title + year + kind match may be
+      // minted, so a stale year in the sheet can never add a second item.
+      const r = otherWork
+        ? yearMatch
+        : yearMatch || sameName[0] || (d.results || [])[0];
+      if (!r?.id) {
+        if (otherWork) return attachClosest(c, named, title, year, kind, list);
+        return c.json({ error: "not found" }, 404);
+      }
       const item = await createFromTmdb(r.id, kind);
-      if (!item) return c.json({ error: "couldn't load from TMDB" }, 502);
+      if (!item) {
+        // Couldn't mint it (TMDB down, or the tmdb id is already taken by the
+        // other kind). Attaching the row to the closest same-title item keeps
+        // the sheet resolvable; the year/kind mismatch is logged above.
+        console.warn(
+          `by-title "${title}" year=${year}: create failed, falling back to a same-title item`,
+        );
+        return attachClosest(c, named, title, year, kind, list);
+      }
       if (list) {
         const updated = setItemLists(item.id, [
           list,
@@ -551,7 +758,7 @@ export function registerItems(app: Hono) {
     // finished (watched_at in 2026). Scoring at 3/4 or even 4/4 while still
     // "on the last episode" keeps it on CW; it only leaves after the season
     // is marked done — i.e. the last-episode tap stamps watched_at/ep_finished_at
-    // via the episodes flow (isShowComplete / isLastSeasonDone), which then
+    // via the episodes flow (isLastSeasonDone), which then
     // triggers transferToShows2026. So score + last episode = move, either
     // order, but scoring alone never moves.
     const shouldAutoFile = finished2026(updated);
@@ -623,6 +830,8 @@ export function registerItems(app: Hono) {
           void pushSheet({
             op: "watched",
             title: stamped.title,
+            year: stamped.year,
+            kind: stamped.kind,
             date: stamped.watched_at,
           });
         }
@@ -729,15 +938,35 @@ export function registerItems(app: Hono) {
       void pushSheet({
         op: "watched",
         title: updated.title,
+        year: updated.year,
+        kind: updated.kind,
         date: updated.watched_at,
       });
     }
+    const onToWatch =
+      updated.lists.includes(TABS.MOVIES) ||
+      updated.lists.includes(TABS.NO_DI);
+    // Diana scored it and James hasn't: file it to "No Di" instead of 2026,
+    // because only she has seen it — it stays a to-watch pick for him. Fires
+    // from the score editor (move_to_2026) or a score arriving from the sheet.
+    if (
+      updated.kind === "movie" &&
+      onToWatch &&
+      seenByDianaOnly(updated) &&
+      (body.move_to_2026 === true ||
+        fields.my_rating !== undefined ||
+        fields.di_rating !== undefined)
+    ) {
+      const moved = moveToNoDi(updated) ?? updated;
+      pushScore(moved, TABS.NO_DI);
+      return c.json(moved);
+    }
+    // James's own score means he has seen it too: file it onto the 2026 tab.
     if (
       (body.move_to_2026 === true || updated.rewatch) &&
       updated.kind === "movie" &&
-      (updated.lists.includes(TABS.MOVIES) ||
-        updated.lists.includes(TABS.NO_DI)) &&
-      (updated.my_rating != null || updated.di_rating != null)
+      onToWatch &&
+      updated.my_rating != null
     ) {
       const kept = updated.lists.filter(
         (l) => l !== TABS.MOVIES && l !== TABS.NO_DI,
@@ -748,9 +977,9 @@ export function registerItems(app: Hono) {
       ];
       setItemLists(id, lists);
       if (!updated.watched_at) updateItem(id, { watched_at: today() });
-      for (const t of [TABS.MOVIES, TABS.NO_DI]) {
-        if (updated.lists.includes(t)) void pushSheet(removeCmd(updated, t));
-      }
+      // Destination row first, source rows second — see moveToNoDi: a sheet with
+      // no row at all reads as "deleted" to doSync, while a briefly duplicated
+      // row is self-correcting.
       void pushSheet({
         op: "add",
         tab: TABS.WATCH_2026,
@@ -763,6 +992,9 @@ export function registerItems(app: Hono) {
         d: updated.di_rating,
         date: updated.watched_at || today(),
       });
+      for (const t of [TABS.MOVIES, TABS.NO_DI]) {
+        if (updated.lists.includes(t)) void pushSheet(removeCmd(updated, t));
+      }
       return c.json(getItemById(id) ?? updated);
     }
     return c.json(stripScored(updated) ?? updated);
@@ -771,12 +1003,31 @@ export function registerItems(app: Hono) {
   app.put("/api/items/:id/lists", async (c) => {
     const id = c.req.param("id");
     const body = await c.req.json().catch(() => ({}));
-    const lists = Array.isArray(body.lists)
+    const given = Array.isArray(body.lists)
       ? collapsePrimaries(body.lists.map(String))
       : null;
-    if (!lists) return c.json({ error: "lists array required" }, 400);
+    if (!given) return c.json({ error: "lists array required" }, 400);
+    let lists = given;
     const it = getItemById(id);
     if (!it) return c.json({ error: "not found" }, 404);
+    // A bulk reconcile may not un-list a show that is mid-season. doSync
+    // derives list membership from the tabs it can read, and the spreadsheet
+    // routinely lacks the row the app just pushed — the gateway queues each
+    // push and takes seconds per call, so a sync landing in that window sees a
+    // missing row. For a movie that means "the user deleted it"; for a show the
+    // app is tracking it means the push hasn't landed. Keep the show's own
+    // tracking lists and say so, so a list change made by hand still works.
+    if (isSyncClient(c) && activelyTracked(it)) {
+      const missing = it.lists.filter(
+        (l) => isShowList(l) && !lists.includes(l),
+      );
+      if (missing.length) {
+        console.warn(
+          `sync tried to un-list in-progress show "${it.title}" (${it.id}) from ${missing.join(", ")} — keeping them`,
+        );
+        lists = collapsePrimaries([...missing, ...lists]);
+      }
+    }
     if (!lists.length) {
       if (!internal(c)) {
         for (const t of it.lists) {
@@ -874,6 +1125,52 @@ export function registerItems(app: Hono) {
     return c.json({ updated });
   });
 
+  // A movie James has scored is seen, so it does not belong on a to-watch tab.
+  // The sheet sync re-adds rows from Movies / No Di whenever they are still
+  // there (a stale row, a hand-edit), so this sweeps them all off in one pass
+  // instead of card by card: each title keeps every other list it is on, and a
+  // title left with nothing goes to 2026 — the tab holding what he has watched.
+  // Unscored movies are untouched, and shows are never involved.
+  app.post("/api/tidy-watched", async (c) => {
+    const moved: { id: string; title: string; from: string[]; to: string[] }[] =
+      [];
+    for (const it of listItems()) {
+      if (it.kind !== "movie" || it.my_rating == null) continue;
+      const drop = it.lists.filter(
+        (l) => l === TABS.MOVIES || l === TABS.NO_DI,
+      );
+      if (!drop.length) continue;
+      const kept = it.lists.filter((l) => !drop.includes(l));
+      const lists = kept.length ? kept : [TABS.WATCH_2026];
+      // Destination row first, source rows second — see moveToNoDi: a title with
+      // no row at all reads as "deleted" to doSync, a briefly duplicated row is
+      // self-correcting.
+      if (lists.includes(TABS.WATCH_2026) && !it.lists.includes(TABS.WATCH_2026))
+        void pushSheet({
+          op: "add",
+          tab: TABS.WATCH_2026,
+          title: it.title,
+          year: it.year,
+          status: it.status,
+          genres: it.genres,
+          taste_score: it.taste_score,
+          j: it.my_rating,
+          d: it.di_rating,
+          date: it.watched_at,
+          reference: it.reference,
+        });
+      for (const t of drop) void pushSheet(removeCmd(it, t));
+      const updated = setItemLists(it.id, lists);
+      if (updated)
+        moved.push({ id: it.id, title: it.title, from: drop, to: lists });
+    }
+    if (moved.length)
+      console.log(
+        `tidy: moved ${moved.length} watched movie(s) off the to-watch tabs`,
+      );
+    return c.json({ moved: moved.length, items: moved });
+  });
+
   app.post("/api/archive-consolidate", async (c) => {
     const yearLists: Set<string> = new Set(TABS.ARCHIVE_YEARS);
     let moved = 0;
@@ -951,12 +1248,37 @@ export function registerItems(app: Hono) {
     const id = c.req.param("id");
     const it = getItemById(id);
     if (!it) return c.json({ error: "not found" }, 404);
+    // Only the spreadsheet calls this (the app's own UI re-saves the list set
+    // through PUT …/lists). doSync deletes an item when no tab it reads has a
+    // row for it — but for a show the app is in the middle of watching, a
+    // missing row means the row is missing, not that the show is gone: the
+    // sheet gateway is slow, and two items whose titles normalize the same
+    // (the 2026 show "Carrie" and the 2002 TV movie) make one row serve two
+    // items, the losing one looking deleted. Refuse and log it rather than
+    // dropping a show with its episode history.
+    if (activelyTracked(it)) {
+      console.warn(
+        `refusing to delete in-progress show "${it.title}" (${it.id}, lists=${it.lists.join(", ")}) — the spreadsheet sees no row for it`,
+      );
+      return c.json(
+        {
+          error: "in-progress show",
+          detail:
+            "the app is tracking episodes for this show; remove it in the app (or clear its episodes) to delete it",
+          item: it,
+        },
+        409,
+      );
+    }
     if (!internal(c)) {
       for (const t of it.lists) {
         void pushSheet(removeCmd(it, t));
       }
     }
     deleteItem(id);
+    console.log(
+      `deleted "${it.title}" (${it.year ?? "?"}, ${it.kind}) at the spreadsheet's request; was on ${it.lists.join(", ") || "no lists"}`,
+    );
     return c.json({ ok: true });
   });
 
@@ -975,6 +1297,17 @@ export function registerItems(app: Hono) {
     if (!it.lists.includes(from))
       return c.json({ error: `not on ${from}` }, 400);
     if (from === to) return c.json(it);
+    // A manual move can't drop a scored movie back onto a to-watch tab; say so
+    // instead of silently relocating it back on the next write.
+    if (blockedFromList(it, to))
+      return c.json(
+        {
+          error: seenByJames(it)
+            ? `"${it.title}" is already scored — it belongs on 2026, not ${to}`
+            : `Diana has already scored "${it.title}" — it belongs on No Di`,
+        },
+        400,
+      );
     const lists = it.lists.filter((l) => l !== from);
     if (PRIMARY_SET.has(to)) {
       for (const l of lists.filter((l) => PRIMARY_SET.has(l) && l !== to))
