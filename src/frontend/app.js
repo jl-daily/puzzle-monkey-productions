@@ -174,6 +174,57 @@ function fmtDate(s) {
   return d.toLocaleDateString(undefined, opts);
 }
 
+// The date a rewatch belongs to is the viewing date: on 2026 the emblem only
+// marks the card (it must not rewrite the date to today), so watched_at is the
+// day it was watched. Fall back to the older rewatched_at stamp.
+function rewatchLabel(it) {
+  const d = it.watched_at || it.rewatched_at;
+  return d ? `Rewatched ${fmtDate(d)}` : "Rewatched";
+}
+
+// Inline editor for "Seen N×". Like the score editor: Enter saves, Escape
+// cancels, blur saves.
+function editWatchCount(btn, it) {
+  const input = document.createElement("input");
+  input.type = "number";
+  input.min = "0";
+  input.max = "999";
+  input.className = "watch-count-input";
+  input.value = String(it.watch_count || 1);
+  input.title = `How many times you've seen "${it.title}"`;
+  btn.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    if (!save) return render();
+    const n = Math.round(Number(input.value));
+    if (!Number.isFinite(n) || n < 0) return render();
+    api(`/api/items/${it.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ watch_count: Math.min(999, n) }),
+    })
+      .then((updated) => {
+        Object.assign(it, updated);
+        render();
+      })
+      .catch((err) => {
+        toast(err.message, true);
+        render();
+      });
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") return finish(false);
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 function fmtRuntime(m) {
   const h = Math.floor(m / 60);
   const rem = m % 60;
@@ -989,6 +1040,11 @@ function card(it, list, showLists = false) {
         ${epDatesChip}
         ${watched ? `<span class="watched">${watched}</span>` : ""}
         ${
+          it.kind === "movie" && (it.watch_count || 0) > 0
+            ? `<button class="watch-count" title="How many times you've seen it — click to change">Seen ${it.watch_count}×</button>`
+            : ""
+        }
+        ${
           showLists && it.lists && it.lists.length
             ? `<span class="lists-tag">${it.lists.join(" · ")}</span>`
             : ""
@@ -1056,7 +1112,7 @@ function card(it, list, showLists = false) {
       it.kind === "movie"
         ? `<span class="rw-emblem${it.rewatch ? " on" : ""}" title="${
             it.rewatch
-              ? `Rewatched ${it.rewatched_at ? fmtDate(it.rewatched_at) : ""} — click to clear`
+              ? `${rewatchLabel(it)} — click to clear`
               : "Mark as rewatched"
           }">🔁</span>`
         : ""
@@ -1129,6 +1185,13 @@ function card(it, list, showLists = false) {
           render();
         })
         .catch((err) => toast(err.message, true));
+    });
+
+  const countBtn = el.querySelector(".watch-count");
+  if (countBtn)
+    countBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      editWatchCount(countBtn, it);
     });
 
   const theaterBtn = el.querySelector(".theater-emblem");

@@ -398,6 +398,7 @@ const PATCH_FIELDS = [
   "reference",
   "watched_at",
   "first_watched_at",
+  "watch_count",
   "review",
   "di_review",
   "providers",
@@ -559,6 +560,7 @@ export function registerItems(app: Hono) {
         const stamped = updateItem(ready.id, {
           rewatch: true,
           rewatched_at: ready.rewatched_at || today(),
+          watch_count: Math.max(2, ready.watch_count || 0),
         });
         if (stamped) {
           Object.assign(ready, stamped);
@@ -805,35 +807,47 @@ export function registerItems(app: Hono) {
       updated.rewatch !== before.rewatch &&
       updated.kind === "movie"
     ) {
-      if (updated.rewatch && !updated.rewatched_at) {
-        const stamped = updateItem(id, { rewatched_at: today() });
+      const on2026 = updated.lists.includes(TABS.WATCH_2026);
+      // A rewatch means at least two viewings. Never lower a higher count the
+      // user set by hand.
+      if (updated.rewatch && (updated.watch_count ?? 0) < 2) {
+        const stamped = updateItem(id, { watch_count: 2 });
         if (stamped) Object.assign(updated, stamped);
       }
-      // Marking a rewatch is a fresh viewing: refresh watched_at so the item
-      // jumps back to the top of the 2026 tab (both the server query and the
-      // client sort order by watched_at DESC). Mirrored to the sheet because
-      // doSync pulls watched dates back sheet -> app. Skipped when the PATCH
-      // carries its own watched_at — an explicit date wins.
-      if (
-        updated.rewatch &&
-        fields.watched_at === undefined &&
-        updated.watched_at !== today()
-      ) {
-        const stamped = updateItem(id, {
-          ...(updated.first_watched_at == null && updated.watched_at
-            ? { first_watched_at: updated.watched_at }
-            : {}),
-          watched_at: today(),
-        });
-        if (stamped) {
-          Object.assign(updated, stamped);
-          void pushSheet({
-            op: "watched",
-            title: stamped.title,
-            year: stamped.year,
-            kind: stamped.kind,
-            date: stamped.watched_at,
+      // A card already on 2026 has a watch date: the emblem only turns the
+      // yellow border on/off there. The viewing already happened on that date;
+      // stamping "today" would rewrite history and jump the card to the top.
+      if (!on2026) {
+        if (updated.rewatch && !updated.rewatched_at) {
+          const stamped = updateItem(id, { rewatched_at: today() });
+          if (stamped) Object.assign(updated, stamped);
+        }
+        // Marking a rewatch is a fresh viewing: refresh watched_at so the item
+        // jumps back to the top of the 2026 tab (both the server query and the
+        // client sort order by watched_at DESC). Mirrored to the sheet because
+        // doSync pulls watched dates back sheet -> app. Skipped when the PATCH
+        // carries its own watched_at — an explicit date wins.
+        if (
+          updated.rewatch &&
+          fields.watched_at === undefined &&
+          updated.watched_at !== today()
+        ) {
+          const stamped = updateItem(id, {
+            ...(updated.first_watched_at == null && updated.watched_at
+              ? { first_watched_at: updated.watched_at }
+              : {}),
+            watched_at: today(),
           });
+          if (stamped) {
+            Object.assign(updated, stamped);
+            void pushSheet({
+              op: "watched",
+              title: stamped.title,
+              year: stamped.year,
+              kind: stamped.kind,
+              date: stamped.watched_at,
+            });
+          }
         }
       }
       const tab = typeof body.tab === "string" ? body.tab : "";

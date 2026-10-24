@@ -173,6 +173,20 @@ if (!cols.some((c) => c.name === "rewatched_at")) {
 if (!cols.some((c) => c.name === "first_watched_at")) {
   db.run("ALTER TABLE items ADD COLUMN first_watched_at TEXT");
 }
+// How many times a movie has been seen. 1 for a watched movie, 2+ when it has
+// been rewatched. The count is a movie concept; show viewings live on the
+// season entries. Backfill from the dates/flags the app already has.
+if (!cols.some((c) => c.name === "watch_count")) {
+  db.run(
+    "ALTER TABLE items ADD COLUMN watch_count INTEGER NOT NULL DEFAULT 0",
+  );
+  db.run(`UPDATE items SET watch_count = CASE
+      WHEN rewatched_at IS NOT NULL OR first_watched_at IS NOT NULL OR rewatch = 1 THEN 2
+      WHEN watched_at IS NOT NULL OR my_rating IS NOT NULL THEN 1
+      ELSE 0
+    END
+    WHERE kind = 'movie'`);
+}
 if (!cols.some((c) => c.name === "runtime")) {
   db.run("ALTER TABLE items ADD COLUMN runtime INTEGER");
 }
@@ -248,6 +262,8 @@ export type Item = {
   // Original viewing date, kept when a rewatch moves watched_at to the
   // rewatch date (so the 2026 tab tops out) — lets a card show both dates.
   first_watched_at: string | null;
+  // Times seen (movies). 1 for a watched movie, 2+ after rewatches.
+  watch_count: number;
   review: string | null;
   di_review: string | null;
   providers: Provider[];
@@ -351,6 +367,7 @@ function rowToItem(row: Row): Item {
     list_dates: {},
     theater: !!row.theater,
     rewatch: !!row.rewatch,
+    watch_count: row.watch_count ?? 0,
     di_confirmed: !!row.di_confirmed,
     current_season: row.current_season ?? null,
     pinned: row.pinned ?? 0,
@@ -442,6 +459,7 @@ export function createItem(
     | "rated_at"
     | "watched_at"
     | "first_watched_at"
+    | "watch_count"
     | "created_at"
     | "review"
     | "positions"
@@ -501,6 +519,7 @@ export function updateItem(
       | "reference"
       | "watched_at"
       | "first_watched_at"
+      | "watch_count"
       | "review"
       | "providers"
       | "seasons"
@@ -530,6 +549,17 @@ export function updateItem(
 ): Item | null {
   const before = getItemById(id);
   if (!before) return null;
+  // A watched movie has been seen at least once. Keep the count from sitting at
+  // 0 when the date or James's score arrives through a path that doesn't know
+  // about watch_count (sheet sync, auto-file to 2026, the score editor).
+  if (
+    before.kind === "movie" &&
+    (before.watch_count ?? 0) === 0 &&
+    fields.watch_count === undefined &&
+    (fields.watched_at || fields.my_rating != null)
+  ) {
+    fields.watch_count = 1;
+  }
   const rated =
     (fields.my_rating !== undefined && fields.my_rating !== before.my_rating) ||
     (fields.di_rating !== undefined && fields.di_rating !== before.di_rating);

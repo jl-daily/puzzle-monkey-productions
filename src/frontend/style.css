@@ -1388,6 +1388,34 @@ mark {
   color: var(--green);
 }
 
+/* "Seen N×" — click to edit the number of viewings. */
+.card .watch-count,
+.card .watch-count-input {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12px;
+  padding: 1px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: transparent;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+
+.card .watch-count {
+  cursor: pointer;
+}
+
+.card .watch-count:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.card .watch-count-input {
+  width: 62px;
+  outline: none;
+}
+
 .card .added {
   color: #3b82f6;
   font-weight: 600;
