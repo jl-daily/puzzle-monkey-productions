@@ -15,6 +15,11 @@ bun install
 bun run dev            # http://localhost:3002
 ```
 
+Taste.io lookups go through `taste.py`, which needs
+`pip3 install curl_cffi` (it impersonates a browser TLS fingerprint to get past
+Cloudflare). Without it every lookup silently returns no score. To fill gaps in
+bulk: `bun src/taste-fill.ts 2026` (add `--dry` to preview).
+
 ## Host it 24/7 (Railway)
 
 1. Push this repo to GitHub.

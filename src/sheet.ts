@@ -6,16 +6,58 @@ const GATEWAY = process.env.SHEET_URL || "";
 const GATEWAY_TOKEN = process.env.SHEET_TOKEN || "";
 
 // Best-effort: fetch the taste.io score for an item that just landed on a
-// list and store it. No-op when a score is already known or no token is set.
-export function pullTaste(item: Item): void {
+// list and store it. No-op when a score is already known.
+//
+// A null answer usually means taste.io has no match for that title, so remember
+// when we asked and don't ask again on every render/PATCH — the card's "Taste ?"
+// button retries by hand.
+//
+// Each lookup spawns python and hits taste.io, so a bulk move (the tidy sweep,
+// a sheet reconcile) must not fan out into fifty at once: queue them and keep
+// two in flight.
+const tasteTried = new Map<string, number>();
+const tasteQueue: Item[] = [];
+let tasteBusy = 0;
+const TASTE_MAX = 2;
+const TASTE_RETRY_MS = 10 * 60 * 1000;
+
+export function pullTaste(item: Item, opts: { force?: boolean } = {}): void {
   if (item.taste_score != null) return;
-  tasteScore(item.title, item.kind, item.year)
-    .then((s) => {
-      if (s == null || s === item.taste_score) return;
-      const updated = updateItem(item.id, { taste_score: s });
-      if (updated) pushScore(updated);
-    })
-    .catch(() => {});
+  const tried = tasteTried.get(item.id) ?? 0;
+  if (!opts.force && Date.now() - tried < TASTE_RETRY_MS) return;
+  if (tasteQueue.some((q) => q.id === item.id)) return;
+  tasteTried.set(item.id, Date.now());
+  tasteQueue.push(item);
+  drainTaste();
+}
+
+function drainTaste(): void {
+  while (tasteBusy < TASTE_MAX && tasteQueue.length) {
+    const item = tasteQueue.shift()!;
+    tasteBusy++;
+    tasteScore(item.title, item.kind, item.year)
+      .then((s) => {
+        if (s == null) {
+          console.log(
+            `taste: no score for "${item.title}"${item.year ? ` (${item.year})` : ""}`,
+          );
+          return;
+        }
+        if (s === item.taste_score) return;
+        const updated = updateItem(item.id, { taste_score: s });
+        if (updated) {
+          console.log(`taste: "${item.title}" -> ${s}`);
+          pushScore(updated);
+        }
+      })
+      .catch((e) =>
+        console.error(`taste: lookup failed for "${item.title}": ${e}`),
+      )
+      .finally(() => {
+        tasteBusy--;
+        drainTaste();
+      });
+  }
 }
 
 let gatewayQueue: Promise<void> = Promise.resolve();

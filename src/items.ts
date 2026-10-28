@@ -14,7 +14,7 @@ import {
 } from "./db";
 import type { Item } from "./db";
 import { watchProviders } from "./providers";
-import { normTitle, tasteUrl } from "./taste";
+import { normTitle, tasteScore, tasteUrl } from "./taste";
 import {
   TABS,
   today,
@@ -342,6 +342,14 @@ async function startSeason(it: Item, season: number): Promise<Item> {
     status: cur.status === "done" ? cur.status : "watching",
   });
   return u2 ?? cur;
+}
+
+// A title that reaches a watched tab or a to-watch pick should pick up its
+// taste.io score even when it never went through attach() — auto-filing a
+// scored movie onto 2026, moving a rewatch there, the tidy sweep. pullTaste
+// throttles repeats, so calling this on every such write is cheap.
+function maybePullTaste(it: Item): void {
+  if (it.taste_score == null) pullTaste(it);
 }
 
 function attach(it: Item, list: string): Item {
@@ -973,6 +981,7 @@ export function registerItems(app: Hono) {
     ) {
       const moved = moveToNoDi(updated) ?? updated;
       pushScore(moved, TABS.NO_DI);
+      maybePullTaste(moved);
       return c.json(moved);
     }
     // James's own score means he has seen it too: file it onto the 2026 tab.
@@ -1009,8 +1018,11 @@ export function registerItems(app: Hono) {
       for (const t of [TABS.MOVIES, TABS.NO_DI]) {
         if (updated.lists.includes(t)) void pushSheet(removeCmd(updated, t));
       }
-      return c.json(getItemById(id) ?? updated);
+      const filed = getItemById(id) ?? updated;
+      maybePullTaste(filed);
+      return c.json(filed);
     }
+    maybePullTaste(updated);
     return c.json(stripScored(updated) ?? updated);
   });
 
@@ -1077,6 +1089,7 @@ export function registerItems(app: Hono) {
           });
       }
     }
+    maybePullTaste(updated);
     return c.json(stripScored(updated) ?? updated);
   });
 
@@ -1117,6 +1130,23 @@ export function registerItems(app: Hono) {
     return c.json({
       url: `https://www.taste.io/search?q=${encodeURIComponent(title)}`,
     });
+  });
+
+  // Fetch the taste.io score for one title on demand — the "Taste ?" chip on a
+  // card with no score. Slow (one python + taste.io round trip), so it is only
+  // called from a click or the add/rewatch paths, never from a list render.
+  app.post("/api/items/:id/taste", async (c) => {
+    const it = getItemById(c.req.param("id"));
+    if (!it) return c.json({ error: "not found" }, 404);
+    const score = await tasteScore(it.title, it.kind, it.year);
+    if (score == null)
+      return c.json(
+        { error: `taste.io has no score for "${it.title}"` },
+        404,
+      );
+    const updated = updateItem(it.id, { taste_score: score });
+    if (updated) pushScore(updated);
+    return c.json(updated ?? it);
   });
 
   app.post("/api/taste", async (c) => {
@@ -1175,8 +1205,10 @@ export function registerItems(app: Hono) {
         });
       for (const t of drop) void pushSheet(removeCmd(it, t));
       const updated = setItemLists(it.id, lists);
-      if (updated)
+      if (updated) {
         moved.push({ id: it.id, title: it.title, from: drop, to: lists });
+        maybePullTaste(updated);
+      }
     }
     if (moved.length)
       console.log(

@@ -1031,7 +1031,7 @@ function card(it, list, showLists = false) {
         ${prov ? `<span class="providers">${prov}</span>` : ""}
       </div>
       <div class="meta">
-        ${tasteColor ? `<span class="taste" style="background:${tasteColor}">Taste ${it.taste_score}</span>` : ""}
+        ${tasteColor ? `<span class="taste" style="background:${tasteColor}">Taste ${it.taste_score}</span>` : `<button class="taste retry" title="Look up this title's Taste score on taste.io">Taste ?</button>`}
         ${scores}
         ${showmeta ? `<span class="episodes">${showmeta}</span>` : ""}
         ${runtimeTxt ? `<span class="runtime">${runtimeTxt}</span>` : ""}
@@ -1192,6 +1192,27 @@ function card(it, list, showLists = false) {
     countBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       editWatchCount(countBtn, it);
+    });
+
+  // No Taste score yet (only happens when taste.io had no match when the title
+  // was added, or the lookup failed) — let the card ask again on demand.
+  const tasteBtn = el.querySelector(".taste.retry");
+  if (tasteBtn)
+    tasteBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (tasteBtn.disabled) return;
+      tasteBtn.disabled = true;
+      tasteBtn.textContent = "Taste …";
+      api(`/api/items/${it.id}/taste`, { method: "POST" })
+        .then((updated) => {
+          Object.assign(it, updated);
+          render();
+        })
+        .catch((err) => {
+          tasteBtn.disabled = false;
+          tasteBtn.textContent = "Taste ?";
+          toast(err.message, true);
+        });
     });
 
   const theaterBtn = el.querySelector(".theater-emblem");

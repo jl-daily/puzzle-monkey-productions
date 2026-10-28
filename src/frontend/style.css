@@ -1357,6 +1357,26 @@ mark {
   flex-shrink: 0;
 }
 
+/* No score yet: a faint chip that asks taste.io when clicked. */
+.card .taste.retry {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text2);
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.card .taste.retry:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.card .taste.retry:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
 .scores {
   color: var(--accent);
   font-weight: 600;
